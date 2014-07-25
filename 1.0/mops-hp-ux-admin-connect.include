@@ -1,0 +1,130 @@
+#!/usr/local/bin/expect
+# 
+# Name: mops-hp-ux-admin-connect.include
+# Purpose: A script for Connecting to HP-UX servers
+#		in MOPS and adding accounts
+# Author: me@jpike.net
+#
+# Updates/Revisions:
+#
+
+# Global variables
+set hpuxrootpassword "w3bba\$3d"
+
+# Administrate users
+proc adminusers {} {
+	global log_file prompt date updateuseradminarray server memolog defaultuserpass useradmindefaulthome useradmindefaultgroup useradmindefaultshell username hpuxserver
+
+	set prompt "(%|\\\$|#|>|.$username.:|$hpuxserver) ?$"
+
+	# Retrieve entries out of the array to process
+	foreach tempusername [array names updateuseradminarray] {
+		set temparray $updateuseradminarray($tempusername)
+		set listarray [split $temparray ":"]
+		set usergcos [lindex $listarray 0]
+		set useroperation [lindex $listarray 1]
+
+		# Add the user
+		if {[string compare $useroperation "add"] == 0} {
+			# Add the account
+			send -- "useradd -c \"$usergcos\" -d $useradmindefaulthome/$tempusername -m -g $useradmindefaultgroup -s $useradmindefaultshell $tempusername\r"
+			expect -re $prompt
+
+			# Set the password
+			send -- "passwd $tempusername\r"
+
+			expect {
+				-re "Enter choice here.*" {
+					send -- "p\r"
+					exp_continue
+				} "assword:" {
+	   			send -- "$defaultuserpass\r"
+					exp_continue
+				} -re $prompt {
+				}
+			}
+
+			# Set default account expiry
+			send -- "passwd -n 2 -w 3 -x 30 $tempusername\r"
+			expect -re $prompt
+
+			# Set account to reset password on login
+			send -- "passwd -f $tempusername\r"
+			expect -re $prompt
+
+			# Log updates
+			sendlog "Adding $tempusername with gcos of \"$usergcos\" on $hpuxserver\n"
+
+			send -- "sh -c \"echo \'$date-$username-Added account for user: $tempusername\' >> $memolog\"\r"
+			expect -re $prompt
+			send -- "sh -c \"echo \'-----------------------------------------------------------\' >> $memolog\"\r"
+			expect -re $prompt
+		} elseif {[string compare $useroperation "delete"] == 0} {
+			# Delete user
+			send -- "userdel $tempusername\r"
+			expect -re $prompt
+
+			# Log updates
+			sendlog "Deleting $tempusername on $hpuxserver\n"
+
+			send -- "sh -c \"echo \'$date-$username-Deleted account for user: $tempusername\' >> $memolog\"\r"
+			expect -re $prompt
+			send -- "sh -c \"echo \'-----------------------------------------------------------\' >> $memolog\"\r"
+			expect -re $prompt
+		} elseif {[string compare $useroperation "lock"] == 0} {
+			# Lock the password for the account
+			send -- "passwd -l $tempusername\r"
+			expect -re $prompt
+
+			# Log updates
+			sendlog "Locking account $tempusername on $hpuxserver\n"
+
+			send -- "sh -c \"echo \'$date-$username-Locked account for user: $tempusername\' >> $memolog\"\r"
+			expect -re $prompt
+			send -- "sh -c \"echo \'-----------------------------------------------------------\' >> $memolog\"\r"
+			expect -re $prompt
+		}
+	}
+
+	return 0
+}
+
+# Become root on the middle server
+send -- "su\r"
+expect "assword:"
+send -- "$hpuxrootpassword\r"
+expect -re $prompt
+
+# Get the 2nd servername from the command line
+incr i
+
+# Iterate through the remaining server lines
+for {set j $i} {$j<$argc} {incr j} {
+   set arg [lindex $argv $j]
+	set hpuxserver [lindex $argv $j]
+	set prompt "(%|\\\$|#|>|.$username.:|$hpuxserver) ?$"
+
+	send -- "\r"
+	expect -re $prompt
+	send -- "rlogin $hpuxserver\r"
+	expect -re $prompt
+
+	# If specified, audit users older than 120 days
+	if {[info exists adminusersfile]} {
+		adminusers
+	}	
+
+	# If specified, run a command
+  	if {[info exists runcmd]} {
+  		runcommand
+  	}
+
+  	# If specified, run a sudo command
+  	if {[info exists sudo]} {
+		runsudo none $sudo
+  	}
+
+	send -- "\r"
+	expect -re $prompt
+	send -- "exit\r"
+}

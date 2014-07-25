@@ -1,0 +1,81 @@
+#!/usr/local/bin/expect
+# 
+# Name: veritas-license-audit.include
+# Purpose: A script for Connecting to UNIX servers
+#		and gathering Veritas License information
+# Author: me@jpike.net
+#
+# Updates/Revisions:
+#
+# 03/27/2007 - Added a query for Solaris Version info.
+
+# Turn on debugging for this function
+#exp_internal 1
+
+# Get the Veritas Licenses
+proc getveritaslicenses {vxlicensecommand} {
+	global prompt server log_file
+	
+	sendlog "Vxlicense Data Start\n"
+	runsudo none "$vxlicensecommand"
+	sendlog "Vxlicense Data Stop\n"
+}
+
+# Determine the Veritas version running on this machine
+proc getveritasversion {} {
+	global prompt
+
+	set timeout -1
+
+	send -- "pkginfo -l VRTSvxvm | grep -i version\n"
+
+	expect_before {
+		-re "(version|VERSION|Version): *((\[0-9\.]+).*)\r\n" {
+			expect_before
+			sendlog "Vxvm Version: $expect_out(2,string)\n"
+			exp_continue
+		}
+	}
+
+	expect -re $prompt
+	expect_before
+	return $expect_out(3,string)
+}
+
+# Get the version of veritas running on this machine
+set veritasversion [getveritasversion]
+
+if {[info exists veritasversion]} {
+	set timeout -1
+
+	sendlog "Server: $server\n"
+	sendlog "Modinfo Start\n"
+	runsudo none "modinfo | egrep '(vxvm|vxfs|vxdmp)'"
+	sendlog "Modinfo Stop\nVxfs Version Start\n"
+	runsudo none "pkginfo -l VRTSvxfs | grep -i version"
+	sendlog "Vxfs Version Stop\n"
+	sendlog "Kernel Version Start\n"
+	runsudo none "uname -v"
+	sendlog "Kernel Version Stop\nOBP Version Start\n"
+	runsudo none "prtconf -V"
+	sendlog "OBP Version Stop\nSolaris Version Start\n"
+	runsudo none "uname -rs"
+	sendlog "Solaris Version Stop\n"
+
+	if {[regexp "^4\..*" $veritasversion null ]} {
+		set vxlicensecommand "/sbin/vxlicrep"
+		getveritaslicenses $vxlicensecommand
+ 	} elseif {[regexp "^3\.5.*" $veritasversion null ]} {
+		set vxlicensecommand "/sbin/vxlicrep"
+		getveritaslicenses $vxlicensecommand
+       } elseif {[regexp "^3\.\[0,1,2,3,4].*" $veritasversion null ]} {
+		set vxlicensecommand "/usr/sbin/vxlicense -p"
+		getveritaslicenses $vxlicensecommand
+       } elseif {[regexp "^2\..*" $veritasversion null ]} {
+		set vxlicensecommand "/usr/sbin/vxlicense -p"
+		getveritaslicenses $vxlicensecommand
+	} else {
+		set vxlicensecommand "/sbin/vxlicense -p"
+		getveritaslicenses $vxlicensecommand
+	}
+}

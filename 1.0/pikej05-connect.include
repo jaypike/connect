@@ -1,0 +1,76 @@
+# This is a personal process script that is read in by connect.exp
+
+# Turn on debugging for this function
+#exp_internal 1
+
+# Jay's Process
+proc jayproc {} {
+	global username password ftp localhostip prompt
+	send -- "tcsh\r"
+
+	expect_before {
+		-re ":~>" {
+		} "*not found*" {
+		} -re "\r\n>" {
+			# Empty the expect buffer
+			expect_before
+			send -- "$ftp $localhostip\r"
+			expect {
+				-re "Name.*" {
+					send -- "$username\r"
+					expect -re "assword.*"
+					send -- "$password\r"
+					expect -re ">.*"
+					send -- "bin\r"
+					expect -re ">.*"
+					send -- "hash\r"
+					expect -re ">.*"
+					send -- "cd Solaris\r"
+					expect -re ">.*"
+					send -- "get .cshrc\r"
+					expect -re ">.*"
+					send -- "get .aliai\r"
+					expect -re ">.*"
+					send -- "get .login\r"
+					expect -re ">.*"
+					send -- "get .logout\r"
+					expect -re ">.*"
+					send -- "get .vimrc\r"
+					expect -re ">.*"
+					send -- "bye\r"
+					expect -re ">.*"
+					send -- "source .cshrc\r"
+               expect ">"
+				} timeout {
+					sendlog "Error: ftp connection failed to $localhostip\n"
+					send -- "bye\r"
+				} eof {
+					sendlog "Error: ftp connection failed to $localhostip\n"
+					send -- "bye\r"
+				} -re "imeout" {
+					sendlog "Error: ftp connection timeout to $localhostip\n"
+				} -re "onnection refused" {
+					sendlog "Error: ftp connection refused to $localhostip\n"
+					send -- "bye\r"
+				} -re "unknown host" {
+					sendlog "Error: ftp connection unknown host to $localhostip\n"
+					send -- "bye\r"
+				} -re "unknown host" {
+					sendlog "Error: ftp connection unknown host to $localhostip\n"
+					send -- "bye\r"
+				}
+			}
+		}
+	}
+
+	expect -re $prompt
+	expect_before
+}
+
+# Run a process if this is me and not an HP-UX box.
+if {$username=="pikej05" && $osname!="HP-UX" && $osname!="AIX"} {
+	jayproc
+} elseif { $osname=="HP-UX" || $osname=="AIX" } {
+	send -- "hostname\r"
+	expect -re $prompt
+}

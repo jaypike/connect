@@ -1,0 +1,985 @@
+#!/usr/bin/env expect
+# 
+# Name: connect.exp
+# Purpose: A script for Connecting to UNIX servers
+#		and performing various generic functions
+# Author: me@jpike.net
+#
+# Updates/Revisions:
+#
+# 9/12/2006 - Added 'useraudit' ability to try and pull a list of users and
+#					find their last login date (in order to disable unused accts)
+#
+# 9/16/2006 - Added 'updatesudoers' function to modify sudoers file on servers
+# 9/18/2006 - Added 'adminusers' function to handle user administration.
+# 9/25/2006 - Added 'geteditsudoers' ability to copy the 'editsudoers.pl' script
+#					from a specified host and place it in the users bin directory.
+# 9/25/2006 - Added workaround for accounts not allowed to use sudo to /bin/sh
+# 9/26/2006 - Add subroutines to handle password updates.
+# 10/02/2006 - Modified functionality to be run as an aliased script and 'source' in
+#					additional processes from .include files.
+# 10/05/2006 - Added the ability to have a '~/.connect.include' file that will be
+#					read and executed upon login to the remote host.  User specific
+#					functions can be easily added to this file.
+# 10/26/2006 - Added ability to specify output command file rather than the default.
+# 12/14/2006 - Added '-explorerserialsfile' for new function.
+# 5/30/2007 - Added '-changepassword' option.
+# 5/31/2007 - Added functions to the changepassword routine to allow for randomly generated
+#             passwords and to output the passwords to a specified file.
+# 6/11/2007 - Added the 'noforcepasswordchange' option to prevent requring a new password
+#             on initial login.
+# 7/09/2007 - Added counters to the final output to display successful and non-successful
+#             hosts.
+# 08/09/2007 - Adding support for Power Broker, pbrun.
+# 02/18/2008 - Adding a new function for account administration in non-Centrify AND
+#              Centrify based environments.
+
+# Global Variables
+set username [exec whoami]
+set userhome $env(HOME)
+set hostname [exec hostname]
+set localhostip [exec grep $hostname /etc/hosts | head -1 | awk {{print $1}}]
+set pwd [exec pwd]
+set date [exec date +%m%d%Y]
+set log_file "~/command-$date.log"
+set defaultuserpass "Pf1zer00"
+#set defaultuserpass "admin1234"
+set ssh "/usr/bin/ssh"
+set telnet "/usr/bin/telnet"
+set sudocmd "sudo"
+set pbruncmd "pbrun"
+set ftpbase "ftp"
+set ftp "$ftpbase -T 5"
+set ftpeditsudoersserver "jinx.jinxed.net"
+set editsudoersfilename "editsudoers.pl"
+set memolog "/opt/admin/doc/memolog"
+set useradmindefaulthome "/export/home"
+set useradmindefaultgroup "other"
+set useradmindefaultshell "/bin/ksh"
+set usesudonoshelworkaround 1
+set noaccountexpiry 0
+set removeaccountexpiry 0
+set randomnewpassword 0
+set noforcepasswordchange 0
+set successfulhostconnects 0
+set unsuccessfulhostconnects 0
+set servercounter 0
+set centrifyaware 0
+set interact 0
+set timeout -1
+set defaulttimeout 15
+set slowsend 1
+set usepbrun 0
+set commandusepbrun 0
+set trytelnetinstead 0
+set notelnet 0
+set trytelnetinsteaddefault 0
+set prompt "(%|\\\$ |#|>|.$username.:) ?$"
+set DEBUG 0
+#set password "" # Don't put your password here, but you can in ~/.expect.rc, just
+# 						 be sure to chmod 600 the file so noone else can read it.
+#set oldpassword "" # Don't put your password here, but you can in ~/.expect.rc, just
+# 						 be sure to chmod 600 the file so noone else can read it.
+if {![info exists password]} {
+	set password ""
+}
+if {![info exists oldpassword]} {
+	set oldpassword ""
+}
+
+match_max -d 2000
+
+# Update the current path
+set env(PATH) "$env(PATH):/usr/local/bin/"
+
+# Echo information
+stty echo
+
+# Password change process
+proc passwd {password newpassword} {
+	global prompt server username log_file
+    set deniedcounter 0
+
+	send -- "passwd\r"
+
+	expect_before {
+		-re "(((N|n)ew (UNIX (P|p)assword|(P|p)assword)\[:,])|(Enter new Active Directory password:))" {
+			send -- "$newpassword\r"
+			exp_continue
+		} -re "(((R|r)e.*enter (N|n)ew (UNIX (P|p)assword|(P|p)assword))|(Confirm new Active Directory password:)|(E|e)nter the new password again:)" {
+			send -- "$newpassword\r"
+			sendlog "Password changed for $username on $server\n"
+			exp_continue
+		} -notransfer "*ermission denied.*" {
+			sendlog "Error: permission denied error on $server:$deniedcounter\n"
+            if { $deniedcounter==0 } {
+                incr deniedcounter
+                exp_continue
+            } else {
+			    sendlog "Error: there is an error with passwd on $server\n"
+            } 
+        } -re "(passwd: Unsupported nsswitch entry for .passwd:|Permission denied).*$prompt" {
+            send -- "passwd -r files\r"
+            if { $deniedcounter==0 } {
+                incr deniedcounter
+                exp_continue
+            } else {
+			    sendlog "Error: there is an error with passwd on $server\n"
+            } 
+		} -re "Enter choice.*" {
+			send -- "p\r"
+			exp_continue
+		} -re "((P|p)assword|(O|o)ld (P|p)assword):" {
+			send -- "$password\r"
+			exp_continue
+		} -re "((E|e)xisting|(E|e)nter|(E|e)nter your|.current.) ((L|l)ogin|(C|c)urrent|UNIX) (P|p)assword:" {
+			send -- "$password\r"
+			exp_continue
+		} -notransfer "*not found*" {
+			sendlog "Error: passwd not found on $server\n"
+		} -notransfer "*error*" {
+			sendlog "Error: there is an error with passwd on $server\n"
+        }
+	}
+
+	expect -notransfer -re $prompt
+	expect_before
+}
+
+# RunCmd process
+proc runcommand {} {
+	global runcmd password prompt log_file server username
+	log_file $log_file	
+	send -- "$runcmd; echo EndOfCommand\r"
+	expect {
+		-re "(assword:.*| password for $username:.*)" {
+			log_file
+			send -- "$password\r"
+			log_file $log_file	
+			exp_continue
+		} "not found" {
+			sendlog "Error: command not found on $server\n"
+			exp_continue
+			#return 1
+		} -re "(parse|syntax) error" {
+			sendlog "Error: there is an error in the sudoers file on $server\n"
+			exp_continue
+			#return 1
+		} -re "EndOfCommand.*$prompt" {
+		}
+	}
+	log_file
+	sendlog "\n"
+	return 0
+}
+
+# RunSudo process
+proc runsudo {options sudocommand} {
+	global password username prompt server log_file usepbrun sudocmd pbruncmd
+	set attemptcounter 0
+
+    if {$username=="root"} {
+		sendlog "Running $sudocommand on $server\n"
+		send -- "$sudocommand; echo EndOfCommand\r"
+	} elseif {$usepbrun!=0} {
+		sendlog "Running $pbruncmd $sudocommand on $server\n"
+		send -- "$pbruncmd $sudocommand; echo EndOfCommand\r"
+	} else {
+		sendlog "Running $sudocmd $sudocommand on $server\n"
+		send -- "$sudocmd $sudocommand; echo EndOfCommand\r"
+	}
+
+	log_file $log_file	
+
+	expect_before {
+		-re "assword:.*" {
+			log_file
+			send -- "$password\r"
+			log_file $log_file	
+			exp_continue
+		} -re "(sudo: *.ommand not found|sudo: *not found|orry, user .* is not allowed to execute .* as .* on|Request rejected by pbmasterd on | is not in the sudoers file.)" {
+			# If the is not found, wait for prompt then issue next command
+			expect -re $prompt {
+				if {$usepbrun==0} {
+					send -- "$pbruncmd $sudocommand; echo EndOfCommand\r"
+				} else {
+					send -- "$sudocmd $sudocommand; echo EndOfCommand\r"
+				}
+			}
+            if {$attemptcounter>0} {
+                sendlog "Error: Unable to execute command using sudo/pbrun\n"
+                expect_before
+                return 1
+			} elseif {$usepbrun==0} {
+				set usepbrun 1
+			    incr attemptcounter
+				exp_continue
+			} elseif {$usepbrun==1} {
+                set usepbrun 0
+			    incr attemptcounter
+                exp_continue
+            }
+		} -re "(parse|syntax) error" {
+			sendlog "Error: there is an error in the sudoers file on $server\n"
+		}
+	}
+
+	if {$options=="notransfer"} {
+		expect -notransfer -re "EndOfCommand.*$prompt" {
+			log_file
+			sendlog "\n"
+		}
+	} else {
+		expect -re "EndOfCommand.*$prompt" {
+			log_file
+			sendlog "\n"
+		}
+	}
+
+	expect_before 
+	return 0
+}
+
+# Find the operating system
+proc getosname {} {
+	global server prompt
+
+	send -- "uname\r"
+
+	expect {
+		-re "Linux.*$prompt" {
+			return "Linux"
+		} -re "SunOS.*$prompt" {
+			return "SunOS"
+		} -re "HP-UX.*$prompt" {
+			return "HP-UX"
+		} -re "IRIX.*$prompt" {
+			return "IRIX"
+		} -re "AIX.*$prompt" {
+			return "AIX"
+		} -re " not found.*$prompt" {
+			return "Error"
+		}
+	}
+}
+
+# Send info to file
+proc sendlog {arg} {
+	global log_file
+	log_file
+	log_file $log_file
+	send_log $arg
+	log_file
+	}
+
+# Code to slow down operations to keep from outtyping the buffer on destination systems:
+# Taken from (http://expect.nist.gov/example/autoexpect)
+# "A surprising number of programs (rn, ksh, zsh, telnet,
+# etc.) and devices discard or ignore keystrokes that arrive "too
+# quickly" after prompts.  If you find your new script hanging up at
+# one spot, try adding a short sleep just before the previous send.
+# Setting "force_conservative" to 1 (see below) makes Expect do this
+# automatically - pausing briefly before sending each character.  This
+# pacifies every program I know of.  The -c flag makes the script do
+# this in the first place.  The -C flag allows you to define a
+# character to toggle this mode off and on."
+if {$slowsend} {
+	# The first element is an integer that describes the number of bytes to send atomically.
+	# The second element is a real number that describes the number of seconds by which the
+	# atomic sends must be separated. For example, "set send_slow {10 .001}" would force
+	# "send -s" to send strings with 1 millisecond in between each 10 characters sent. 
+	set send_slow {10 0.01}
+
+	# Uncomment this stanza for a VERY conservative sending
+	#set send_slow {1 .1}
+
+	# Rewrite the proc 'send' to always use a '-s' (Slow Send)
+	proc send {ignore arg} {
+		sleep .1
+		exp_send -s -- $arg
+	}
+}
+
+# Dump lots of info if desired
+if {$DEBUG} {
+	exp_internal $DEBUG
+}
+
+# Give a syntax error if nothing was specified on the command line
+if {$argc==0} {
+	send_user -- "Syntax Error: No server specified!\n"
+	send_user -- "\t $argv0 \[options\] host1 host2 host3 . . .\n"
+	send_user -- "\tOptions:\n"
+	send_user -- "\t <-interact> - Interact with remote host\n"
+	send_user -- "\t <-passwd> - Prompt the user for a new password to set on remote host\n"
+	send_user -- "\t <-runcmd \[cmd\]> - Run the listed cmd on the remote host\n"
+	send_user -- "\t <-sudo \[cmd\]>  - Run the listed cmd with sudo on the remote host\n"
+	send_user -- "\t <-pbrun \[cmd\]>  - Run the listed cmd with pbrun on the remote host\n"
+	send_user -- "\t <-user \[username\]> - Connect using the supplied username\n"
+	send_user -- "\t <-password> - Force password prompting\n"
+	send_user -- "\t <-debug> - Enable debug mode\n"
+	send_user -- "\t <-timeout> \[seconds\] - Set the connection timeout in seconds\n"
+	send_user -- "\t <-telnetfirst> - Try telnet before ssh (default is to use ssh first)\n"
+	send_user -- "\t <-notelnet> - Do not try telnet(default is to use ssh first)\n"
+	send_user -- "\t <-logfile \[log file\]> - Use the listed logfile rather than the default name\n"
+	send_user -- "Admin Functions:\n"
+	send_user -- "\t admin-connect \[options\] host1 host2 host3 . . .\n"
+	send_user -- "\tOptions:\n"
+	send_user -- "\t <-useraudit> - Create a list of all users on the server and last login dates\n"
+	send_user -- "\t <-updatesudoers \[updatesudoersfile\]> - Process the listed file for sudoers updates\n"
+	send_user -- "\t <-adminusers \[usersfile\]> - Process the listed file for user administration\n"
+	send_user -- "\t\t\t <-noaccountexpiry> - Don't force passwd change and no expiry info\n"
+	send_user -- "\t\t\t <-group> - default group name to use\n"
+	send_user -- "\t\t\t <-home> - default home directory to use. Ex: /export/home\n"
+	send_user -- "\t\t\t <-defaultpassword \[default password to use\]>\n"
+	send_user -- "\t <-centrifyadminusers \[usersfile\]> - Process the listed file for user administration in both\n"
+    send_user -- "\t\tnon-Centrify and Centrified hosts\n"
+	send_user -- "\t\t\t <-noaccountexpiry> - Don't force passwd change and no expiry info\n"
+	send_user -- "\t\t\t <-group> - default group name to use\n"
+	send_user -- "\t\t\t <-home> - default home directory to use. Ex: /export/home\n"
+	send_user -- "\t\t\t <-defaultpassword \[default password to use\]>\n"
+	send_user -- "\t <-compareusernames \[usersfile\]> - Compare usernames on the server those listed in usersfile\n"
+	send_user -- "\t <-geteditsudoers> - Get the editsudoers.pl file from the source server\n"
+	send_user -- "\t <-getfile \[filename\]> - Transfer local 'filename' to remote host using ftp\n"
+	send_user -- "\t <-changepassword> \[username\] - Change the password and expiry options for an account back to the defaults\n"
+	send_user -- "\t\t\t <-noaccountexpiry> - Do not set account expiration information\n"
+	send_user -- "\t\t\t <-removeaccountexpiry> - Remove account expiry info\n"
+	send_user -- "\t\t\t <-noforcepasswordchange> - Do not force the user to change the password at the next login\n"
+	send_user -- "\t\t\t <-randomnewpassword> \[random new password logfile\] - Change the password to a random password and output info to the specified logfile\n"
+	send_user -- "\t\t\t <-group> - default group name to use\n"
+	send_user -- "\t\t\t <-defaultpassword \[default password to use\]>\n"
+	send_user -- "Alias Functions:\n"
+	send_user -- "\t <alias function name> \[options\] host1 host2 host3 . . .\n"
+	exit
+}
+
+# Parse out the command line options
+for {set i 0} {$i<$argc} {incr i} {
+	set arg [lindex $argv $i]
+	switch -- $arg "-user" {
+		incr i
+		set username [lindex $argv $i]
+		unset password
+		continue
+	} "-password" {
+		unset password
+		continue
+	} "-debug" {
+        set DEBUG 1
+		exp_internal 1
+		continue
+	} "-logfile" {
+		incr i
+		set log_file [lindex $argv $i]
+		continue
+	} "-explorerserialsfile" {
+		incr i
+		set explorerserialsfile [lindex $argv $i]
+		continue
+	} "-defaultpassword" {
+		incr i
+		set defaultuserpass [lindex $argv $i]
+		continue
+	} "-changepassword" {
+		incr i
+		set passwordusername [lindex $argv $i]
+		continue
+	} "-randomnewpassword" {
+		incr i
+		set randomnewpassword 1
+		set randomnewpasswordlogfile [lindex $argv $i]
+		continue
+	} "-home" {
+		incr i
+		set useradmindefaulthome [lindex $argv $i]
+		continue
+	} "-group" {
+		incr i
+		set useradmindefaultgroup [lindex $argv $i]
+		continue
+	} "-timeout" {
+		incr i
+		set defaulttimeout [lindex $argv $i]
+		continue
+    } "-telnetfirst" {
+        set trytelnetinsteaddefault 1
+        continue
+    } "-notelnet" {
+        set notelnet 1
+        continue
+	} "-noforcepasswordchange" {
+		set noforcepasswordchange 1
+		continue
+	} "-interact" {
+		set interact 1
+		continue
+	} "-noaccountexpiry" {
+		set noaccountexpiry 1
+		continue
+	} "-removeaccountexpiry" {
+		set removeaccountexpiry 1
+		set noaccountexpiry 1
+		continue
+	} "-getfile" {
+		incr i
+		set getfilename [lindex $argv $i]
+		continue
+	} "-runcmd" {
+		incr i
+		set runcmd [lindex $argv $i]
+		continue
+	} "-sudo" {
+		incr i
+		set sudo [lindex $argv $i]
+		continue
+	} "-pbrun" {
+		incr i
+        set commandusepbrun 1
+		set sudo [lindex $argv $i]
+		continue
+	} "-passwd" {
+		stty -echo
+		send_user -- "New Password: "
+		expect_user -re "(.*)\n"
+		send_user -- "\n"
+		set newpasswd $expect_out(1,string)
+		send_user -- "Retype new Password: "
+		expect_user -re "(.*)\n"
+		stty echo
+		send_user -- "\n"
+		set newpasswd2 $expect_out(1,string)
+		if ![string match $newpasswd $newpasswd2] {
+			send_user "mismatch - password unchanged\n"
+			exit
+		}
+		continue
+	} "-useraudit" {
+		set auditunusedaccount 1
+		continue
+	} "-geteditsudoers" {
+		set geteditsudoers 1
+		continue
+	} "-updatesudoers" {
+		incr i
+		set updatesudoersfile [lindex $argv $i]
+		set sudoerscounter 0
+
+		if 0==[catch {set updatesfile [open $updatesudoersfile]} errormessage] {
+			while {[gets $updatesfile aline] != -1} {
+				set listarray [split $aline ":"]
+
+				# <username>::<alias group>:<add/delete>
+				set sudoersusername [lindex $listarray 0]
+				set sudoersgroup [lindex $listarray 1]
+				set sudoersoperation [lindex $listarray 2]
+
+				if {[string length $sudoersusername] > 0 && [string length $sudoersgroup] > 0 && [ string length $sudoersoperation] > 0} {
+					set updatesudoersarray($sudoerscounter) "$sudoersusername:$sudoersgroup:$sudoersoperation"
+					incr sudoerscounter
+				} else {
+					send_user "Invalid syntax in $updatesudoersfile!!! Should be\n\n"
+					send_user "<username>:<alias group>:<add/delete>\n"
+					exit
+				}
+			}
+		} else {
+            send_user "Unable to access file $updatesudoersfile!!!\n"
+            exit
+		}
+		continue
+	} "-adminusers" {
+		incr i
+		set adminusersfile [lindex $argv $i]
+
+		if 0==[catch {set updatesfile [open $adminusersfile]} errormessage] {
+			while {[gets $updatesfile aline] != -1} {
+				set listarray [split $aline ":"]
+
+                # Handle input files with different numbers of options:
+                # <username>:<gcos>:<add/delete>
+                # <username>:<uid>:<gid>:<gcos>:<add/delete>
+
+                if {[string length [lindex $listarray 0]] > 0
+                    && [string length [lindex $listarray 1]] > 0
+                    && [string length [lindex $listarray 2]] > 0
+                    && [string length [lindex $listarray 3]] == 0
+                    && [string length [lindex $listarray 4]] == 0} {
+
+				    # <username>:<gcos>:<add/delete>
+				    set useradminusername [lindex $listarray 0]
+				    set usergcos [lindex $listarray 1]
+				    set useradminoperation [lindex $listarray 2]
+
+                    # Add the values into the array
+				    set updateuseradminarray($useradminusername) "none:none:$usergcos:$useradminoperation"
+
+                } elseif {[string length [lindex $listarray 0]] > 0
+                    && [string length [lindex $listarray 1]] > 0
+                    && [string length [lindex $listarray 2]] > 0
+                    && [string length [lindex $listarray 3]] > 0
+                    && [string length [lindex $listarray 4]] > 0} {
+
+				    # <username>:<uid>:<gid>:<gcos>:<add/delete>
+				    set useradminusername [lindex $listarray 0]
+                    set useruid [lindex $listarray 1]
+                    set usergid [lindex $listarray 2]
+				    set usergcos [lindex $listarray 3]
+				    set useradminoperation [lindex $listarray 4]
+
+                    # Add the values into the array
+				    set updateuseradminarray($useradminusername) "$useruid:$usergid:$usergcos:$useradminoperation"
+
+				} else {
+					send_user "Invalid syntax in $adminusersfile!!! Should be\n\n"
+					send_user "<username>:<gcos>:<add/delete/lock>\n"
+                    send_user "or\n"
+                    send_user "<username>:<uid>:<gid>:<gcos>:<add/delete/lock>\n";
+					exit
+				}
+			}
+		} else {
+            send_user "Unable to access file $adminusersfile!!!\n"
+            exit
+        }
+		continue
+	} "-centrifyadminusers" {
+		incr i
+        incr centrifyaware
+		set adminusersfile [lindex $argv $i]
+
+		if 0==[catch {set updatesfile [open $adminusersfile]} errormessage] {
+			while {[gets $updatesfile aline] != -1} {
+				set listarray [split $aline ":"]
+
+                if {[string length [lindex $listarray 0]] > 0
+                    && [string length [lindex $listarray 1]] > 0
+                    && [string length [lindex $listarray 2]] > 0
+                    && [string length [lindex $listarray 3]] > 0
+                    && [string length [lindex $listarray 4]] > 0
+                    && [string length [lindex $listarray 5]] > 0} {
+
+				    # <username>:<uid>:<gid>:<gcos>:<add/delete>
+				    set useradminusername [lindex $listarray 0]
+                    set useruid [lindex $listarray 1]
+                    set usergid [lindex $listarray 2]
+				    set usergcos [lindex $listarray 3]
+                    set centrifycn [lindex $listarray 4]
+				    set useradminoperation [lindex $listarray 5]
+
+                    # Add the values into the array
+				    set updateuseradminarray($useradminusername) "$useruid:$usergid:$usergcos:$centrifycn:$useradminoperation"
+
+				} else {
+					send_user "Invalid syntax in $adminusersfile!!! Should be\n\n"
+                    send_user "<username>:<uid>:<gid>:<gcos>:<centrify cn>:<add/delete/lock>\n";
+					exit
+				}
+			}
+		} else {
+            send_user "Unable to access file $adminusersfile!!!\n"
+            exit
+        }
+
+        # Get the users Centrify AD Admin account information and password
+        send_user -- "Active Directory Admin Account Username: "
+        expect_user -re "(.*)\n"
+		set centrifyadusername $expect_out(1,string)
+
+        stty -echo
+        send_user -- "Active Directory Admin Account Password: "
+        expect_user -re "(.*)\n"
+		set centrifyadpassword $expect_out(1,string)
+		stty echo
+		send_user -- "\n"
+
+		continue
+	} "-compareusernames" {
+		incr i
+		set compareusernamesfile [lindex $argv $i]
+
+		if 0==[catch {set usernamesfile [open $compareusernamesfile]} errormessage] {
+			while {[gets $usernamesfile aline] != -1} {
+				set compareusername [split $aline ":"]
+
+				if {[string length $compareusername] > 0} {
+					set usernamescompare($compareusername) $compareusername 
+				} else {
+					send_user "Invalid syntax in $compareusernamesfile!!! Should be\n\n"
+					send_user "<username>\n"
+					exit
+				}
+			}
+		} else {
+			send_user "Error opening file $compareusernamesfile - $errormessage!!!\n"
+			exit
+		}
+		continue
+	}
+
+	# Get the password, so we don't store it in a text variable above
+	if {![info exists password] || $password == ""} {
+		stty -echo
+		send_user -- "Enter Your Password: "
+		expect_user -re "(.*)\n"
+		stty echo
+		send_user -- "\n"
+		set password $expect_out(1,string)
+	}
+
+	# Set the old password
+	if {![info exists oldpassword]} {
+		set oldpassword $password
+	}
+
+	set server $arg
+    incr servercounter
+
+	# Reset the prompt value to include the server now
+	set prompt "(%|\\\$ |#|>|.$username.:|$server) ?$"
+
+	set time [exec date]
+	sendlog "$time - User: $username => $server\n"
+
+	# Set our timeout to be used for the connections below
+	set timeout $defaulttimeout
+
+	# Start by trying ssh first
+	set safetorun 0
+
+    # Reset the telnet preference
+    if {$trytelnetinsteaddefault==1} {
+        set trytelnetinstead 1
+    }
+
+    # Check the telnet option
+	if {$trytelnetinstead==1} {
+		incr trytelnetinstead -1
+		set pid [spawn $telnet $server]
+	} else {
+		set pid [spawn $ssh -l $username $server]
+	}
+	
+	# If ssh failed, then try telnet
+	expect {
+		-re "name not known" {
+			sendlog "Error: Unknown Hostname: $server!!!\n"
+		} -re "onnection (refused|closed)" {
+			sendlog "Info: ssh connection to $server refused\n"
+			catch { close }
+			catch { wait }
+			set pid [spawn $telnet $server]
+			incr safetorun
+		} eof {
+			sendlog "Info: ssh connection to $server failed\n"
+			catch { close }
+			catch { wait }
+			set pid [spawn $telnet $server]
+			incr safetorun
+		} default {
+			sendlog "Error: ssh to host $server had a Default error!!!\n"
+			catch { close }
+			catch { wait }
+			set pid [spawn $telnet $server]
+			incr safetorun
+		} timeout {
+			sendlog "Error: ssh to host $server Timed Out!!!\n"
+			catch { close }
+			catch { wait }
+			set pid [spawn $telnet $server]
+			incr safetorun
+		} -notransfer -re "(assword|ogin|sername|yes|known|closed)" {
+			incr safetorun
+        } -notransfer -re $prompt {
+            incr safetorun
+		}
+	}
+
+	# If we fail with specified password, use default and change it.
+	set failtruepass1 0
+	set failtruepass2 0
+    if {$commandusepbrun==1} {
+        set usepbrun 1
+    } else { 
+    	set usepbrun 0
+    }
+	set logged_in 0
+
+	# We loop here to try all the options that ssh can throw at us
+	while {$safetorun} {
+
+		# A sub process to handle password updates.
+		proc passwordlogin {loginpassword newpassword connecttype} {
+			global prompt server trytelnetinstead logged_in username failtruepass1 failtruepass2
+ 			if {[string compare $newpassword $loginpassword]} {
+				set resetloginpassword 1
+			} else {
+				set resetloginpassword 0
+			}
+
+			# Code to handle some Solaris versions that prompt for new password before
+			# allowing you to connect
+			expect {
+		        -re "((R|r)e.*enter (N|n)ew (UNIX (P|p)assword|(P|p)assword))" {
+					send -- "$newpassword\r"
+					sendlog "Info: password reset on $server\n"
+					set resetloginpassword 0
+					set failtruepass1 0
+					set failtruepass2 0
+					exp_continue
+		        } -re "((N|n)ew (UNIX (P|p)assword|(P|p)assword)\[:,])" {
+					send -- "$newpassword\r"
+					set resetloginpassword 0
+					exp_continue
+                } -re "Invalid Windows credentials" {
+					sendlog "Error: Incorrect Windows Username and Password combination!!!\n"
+					return 1
+                } -re "(Please enter your personal Windows account :|Windows Active Directory .NT. username:)" {
+                    send -- "$username\r"
+                    exp_continue
+		        } -re "(Windows Active Directory .NT. password:|Confirm new Active Directory password:|Enter new Active Directory password:)" {
+					send -- "$newpassword\r"
+					exp_continue
+                } -re "(not your personal account then answer ... to this question|Press .RETURN. to continue)" {
+                    send -- "\r"
+                    exp_continue
+                } -re "your personal (UNIX account|account) .y.n. (.default y. :|:)" {
+                    send -- "y\r"
+                    exp_continue
+				} -re "chdir.*ermission denied" {
+					exp_continue
+				} -re "ermission denied*" {
+					sendlog "Error: $connecttype attempt to $server failed (permission denied)\n"
+		        } -re "((P|p)assword |(Enter.*login|(O|o)ld) (P|p)assword) *:" {
+					send -- "$loginpassword\r"
+					set resetloginpassword 0
+					set failtruepass1 0
+					set failtruepass2 0
+					exp_continue
+				} -re "Enter choice.*" {
+					send -- "p\r"
+					exp_continue
+				} -re "isabled" {
+					sendlog "Error: Account disabled on $server!!!\n"
+					return 1
+				} -re "closed by foreign host" {
+					sendlog "Error: Disconnected from $server!!!\n"
+					return 1
+                } -re "passwd: Unsupported nsswitch entry for .passwd:." {
+                    send -- "passwd -r files\r"
+                    exp_continue
+				} eof {
+					sendlog "Info: $connecttype connection to $server disconnected\n"
+					# Lets try telnet next time
+					incr i -1
+					incr trytelnetinstead
+					error 1
+				} -notransfer -re "(ogin|sername|assword): $" {
+				} timeout {
+					sendlog "Error: $connecttype to host $server Timed Out!!!\n"
+				} default {
+					sendlog "Info: $connecttype connection to $server disconnected\n"
+				} -notransfer -re $prompt {
+					incr logged_in
+					if {$resetloginpassword==1} {
+						# Dump the buffer
+						expect -re $prompt
+						passwd $loginpassword $newpassword
+					}
+					return 0
+				}
+			}
+		}
+
+		expect {
+			# SSH login
+			-re "assword:" {
+				if {$failtruepass1==1} {
+					incr failtruepass1
+					send -- "$defaultuserpass\r"
+					if 1==[catch {passwordlogin $defaultuserpass $password "ssh"}] {
+						break
+					}
+				} elseif {$failtruepass1==2} {
+					incr failtruepass1
+					send -- "$oldpassword\r"
+					if 1==[catch {passwordlogin $oldpassword $password "ssh"}] {
+						break
+					}
+				} elseif {$failtruepass1==3} {
+					sendlog "Error: Failed ssh connection (3 times) to $server!!!\n"
+					close
+					wait
+					break
+				} else {
+					send -- "$password\r"
+					incr failtruepass1
+					if 1==[catch {passwordlogin $password $password "ssh"}] {
+						break
+					}
+				}
+			} -re "name not known" {
+				sendlog "Error: Unknown Hostname: $server!!!\n"
+				break
+			} -re "closed by foreign host" {
+				sendlog "Error: Disconnected from $server!!!\n"
+				break
+			} -re "yes\/no" {
+				# This is for the ssh known_hosts addition message
+				send -- "yes\r"
+				exp_continue
+			} -re "(ogin|sername): $" {
+				# Telnet login
+				send -- "$username\r"
+				if {$failtruepass2==1} {
+					incr failtruepass2
+					expect "assword:"
+					send -- "$defaultuserpass\r"
+					if 1==[catch {passwordlogin $defaultuserpass $password "telnet"}] {
+						break
+					}
+				} elseif {$failtruepass2==2} {
+					incr failtruepass2
+					expect "assword:"
+					send -- "$oldpassword\r"
+					if 1==[catch {passwordlogin $oldpassword $password "telnet"}] {
+						break
+					}
+				} elseif {$failtruepass2==3} {
+					sendlog "Error: Failed telnet connection (2 times) to $server!!!\n"
+					close
+					wait
+					break
+				} else {
+					expect "assword:"
+					send -- "$password\r"
+					incr failtruepass2
+					if 1==[catch {passwordlogin $password $password "telnet"}] {
+						break
+					}
+				}
+			} -re $prompt {
+				incr logged_in
+				break
+			} eof {
+				sendlog "Info: connection to $server failed\n"
+				break
+			} timeout {
+				sendlog "Error: telnet to host $server Timed Out!!!\n"
+				break
+			} default {
+				sendlog "Error: telnet to host $server had a Default error!!!\n"
+				break
+			}
+		}
+	}
+	
+	if {$logged_in} {
+		sendlog "User: $username successfully connected to $server\n"
+
+		# Set our timeout to be used for the programs below
+		set timeout -1
+
+		# Set some environment variables
+		set osname [getosname]
+
+		if {$osname=="Linux"} {
+			# Linux specific
+		} elseif {$osname=="SunOS"} {
+			# Solaris Specific
+			send -- "stty erase '^?';PATH=\$PATH:/usr/sbin:/usr/local/bin:/opt/sfw/bin\r"
+			expect -re $prompt
+		} elseif {$osname=="HP-UX"} {
+			# HP-UX specific
+			send -- "stty kill '^X' intr '^C' werase '^W' erase '^?';PATH=\$PATH:/usr/sbin:/bin:/usr/bin\r"
+			expect -re $prompt
+		} elseif {$osname=="AIX"} {
+			# AIX specific
+			send -- "stty kill '^X' intr '^C' werase '^W' erase '^?';PATH=\$PATH:/usr/sbin:/bin:/usr/bin\r"
+			expect -re $prompt
+		}
+
+		# Handle included routines based on the called alias
+		if {[regexp "^(\[a-z0-9\\-_\.\/]*\/)(\[^\/]+)" $argv0 null pathtoexp expalias] || \
+			 [regexp "^()(\[^\/]+)" $argv0 null pathtoexp expalias]} {
+			if { $expalias != "connect" && $expalias != "connect.exp" } {
+				if 0==[catch {set fileinfo [exec file $pathtoexp$expalias.include]} errormessage] {
+					if {[regexp "o such" $fileinfo null]} {
+						send_user "\nError opening include file: $pathtoexp$expalias.include!!!\r"
+						sendlog "Error opening include file: $pathtoexp$expalias.include!!!\r"
+					} else {
+							puts "\nLoading $pathtoexp$expalias.include functions."
+						if 0==[catch {source $pathtoexp$expalias.include} errormessage] {
+							puts "\nEnding $pathtoexp$expalias.include functions."
+						} else {
+							puts "\nFailed loading of $pathtoexp$expalias.include functions!!!"
+						}
+					}
+				}
+			}
+		}
+	
+		# Check for the existance of a personal process in ~/.connect.include
+		catch {source ~$username/.connect.include}
+	
+		# If specified, run a command
+		if {[info exists runcmd]} {
+			runcommand
+		}
+	
+		# If specified, run a sudo command
+		if {[info exists sudo]} {
+			runsudo none $sudo
+		}
+	
+		# If specified, change the users password
+		if {[info exists newpasswd]} {
+			passwd $password $newpasswd
+		}
+			
+		# If specified, allow interaction.  Closing the shell terminates the interact	
+		if {$interact} {
+			interact
+		} else {
+			send -- "echo Ending session for $username\r"
+			expect {
+				-re "Ending session for $username.*$prompt" {
+					send -- "exit\r"
+					exp_continue
+				} -re "exit.*$prompt" {
+					send -- "exit\r"
+					exp_continue
+				} eof {
+				} timeout {
+				} default {
+				}
+			}
+		}
+		incr successfulhostconnects
+	} else {
+		sendlog "Error: unable to connect to $server!!\n"
+        set unsuccessfulhostconnectsarray($unsuccessfulhostconnects) "$server"
+		incr unsuccessfulhostconnects
+        if {$trytelnetinsteaddefault==1} {
+            set trytelnetinstead 1
+        } else {
+            set trytelnetinstead 0
+        }
+	}
+
+	catch { close }
+	catch { wait }
+}
+
+if { $successfulhostconnects > 0 && $servercounter > 1 } {
+	puts "\nSuccessful Connections: $successfulhostconnects"
+}
+
+if { $unsuccessfulhostconnects > 0 && [info exists unsuccessfulhostconnectsarray]
+    && $servercounter > 1 } {
+	puts "\nUnSuccessful Connections: $unsuccessfulhostconnects"
+	puts "Servers:"
+
+	for {set tempcounter 0} {$tempcounter < $unsuccessfulhostconnects} {incr tempcounter} {
+		puts "$unsuccessfulhostconnectsarray($tempcounter)"
+	}
+}

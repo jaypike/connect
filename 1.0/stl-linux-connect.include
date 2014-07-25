@@ -1,0 +1,65 @@
+#!/usr/local/bin/expect
+# 
+# Name: stl-linux-connect.include
+# Purpose: A script for Connecting to St. Louis
+#		Linux servers
+# Author: me@jpike.net
+#
+# Updates/Revisions:
+#
+
+# Become root on the middle server
+runsudo none "su"
+
+# Get the 2nd servername from the command line
+incr i
+
+# Iterate through the remaining server lines
+for {set j $i} {$j<$argc} {incr j} {
+   set arg [lindex $argv $j]
+	set linuxserver [lindex $argv $j]
+	#set prompt "(%|\\\$|#|>|.$username.:|$linuxserver) ?$"
+
+	send -- "\r"
+	expect -re $prompt
+	send -- "rsh $linuxserver\r"
+	expect {
+		-re $prompt {
+			# Do nothing
+		} -re "yes\/no" {
+			# This is for the ssh known_hosts addition message
+			send -- "yes\r"
+			exp_continue
+		}
+	}
+
+	send -- "\r"
+	expect -re $prompt
+
+	# If specified, run a command
+  	if {[info exists runcmd]} {
+		runcommand
+  	}
+
+  	# If specified, run a sudo command
+  	if {[info exists sudo]} {
+		runsudo none $sudo
+  	}
+
+  	# If specified, change the users password
+  	if {[info exists newpasswd]} {
+		passwd $password $newpasswd
+  	}
+
+  	# If specified, allow interaction.  Closing the shell terminates the interact
+  	if {$interact} {
+		interact
+  	}
+
+	send -- "\r"
+	expect -re $prompt
+	send -- "exit\r"
+}
+
+# Set the 'i' counter to the last value so the script will end
+set i $j

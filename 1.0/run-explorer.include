@@ -1,0 +1,44 @@
+#!/usr/local/bin/expect
+# 
+# Name: run-explorer.include
+# Purpose: A script for running Sun's Data Collector
+#		program.
+# Author: me@jpike.net
+#
+# Updates/Revisions:
+#
+
+# Turn on debugging for this function
+#exp_internal 1
+
+# Default variables
+set defaultserialsfile "serials.txt"
+
+# Determine the Veritas version running on this machine
+proc getserialnumber {} {
+	global explorerserialsfile server
+
+puts "Hostname: $server Exlorerserialsfile: $explorerserialsfile"
+	if 0==[catch {set serialnumber [exec grep $server $explorerserialsfile | cut -d: -f2]} errormessage] {
+		return $serialnumber
+	} else {
+		puts "Error opening $explorerserialsfile: $errormessage\n"
+	}
+}
+
+if {![info exists explorerserialsfile]} {
+	set explorerserialsfile $defaulserialsfile
+}
+
+# Get the Serial Number of the host we are connected to from a file.
+set serialnumber [getserialnumber]
+
+if {[info exists serialnumber] && [string length $serialnumber] > 0 } {
+	puts "Running explorer on $server with Serial Number $serialnumber"
+
+	# Update the timeout because the explorer scripts can take a long time to run.
+	set timeout -1
+	runsudo none "/net/jinxhome.jinxed.net/raid1/admin/bin/start_explorer -S $serialnumber\r"
+} else {
+	puts "Error: Serial Number for $server not found in $explorerserialsfile"
+}

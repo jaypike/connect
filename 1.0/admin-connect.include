@@ -1,0 +1,1394 @@
+#!/usr/local/bin/expect
+# 
+# Name: admin-connect.include
+# Purpose: A script for Connecting to UNIX servers
+#		and performing various generic functions
+# Author: me@jpike.net
+#
+# Updates/Revisions:
+#
+# 9/12/2006 - Added 'useraudit' ability to try and pull a list of users and
+#					find their last login date (in order to disable unused accts)
+#
+# 9/16/2006 - Added 'updatesudoers' function to modify sudoers file on servers
+# 9/18/2006 - Added 'adminusers' function to handle user administration.
+# 9/25/2006 - Added 'geteditsudoers' ability to copy the 'editsudoers.pl' script
+#					from a specified host and place it in the users bin directory.
+# 9/25/2006 - Added workaround for accounts not allowed to use sudo to /bin/sh
+# 9/26/2006 - Add subroutines to handle password updates.
+# 10/02/2006 - Modified functionality to run as sourced include files.
+# 10/20/2006 - Updating logging routines to reduce memolog entries and
+#					increase performance.
+# 10/20/2006 - Adding 'id' check to verify that a user doesn't pre-exist before
+#					trying to add account.
+# 10/21/2006 - Adding function to compare a local file of usernames to already
+#					allocated usernames on the destination servers.
+# 10/28/2006 - Added the ability to get a file, plus cksum local and remote versions
+#					before getting it.  Very similar to the 'geteditsudoers' function.	
+# 5/30/2007 - Added the functions to change a specified users password back to the
+#             default password and also alter the account expiry options.
+# 5/31/2007 - Added functions to change a users password to a randomly generated
+#             password and to log the output to a file.  This is usefull for
+#             changing the root password on a routine basis, etc.
+# 6/11/2007 - Added the 'noforcepasswordchange' option to prevent requiring a new
+#             password at initial login.
+# 10/05/2007 - Added check for adinfo to prevent adding users to a Centrified host
+# 02/18/2008 - Adding new function for account management in legacy and Centrify
+#              based environments.
+
+# Turn on debugging for this function
+#exp_internal 1
+
+# Process to print long memolog lines
+# This is a workaround to get around a shell limit of 256 characters per command
+proc printmemolog {shellcommand longstring} {
+	global memolog
+
+	set sizeofstring [string length $longstring]
+	set startofstring 0;
+	set maxstringprintsize 150;
+	set endofstring $maxstringprintsize;
+	set stayinloop 1;
+	
+	while {$stayinloop==1} {
+   	if { $startofstring < $sizeofstring } {
+      	if { $endofstring > $sizeofstring } {
+         	# If the endpoint goes past the string size, adjust the range
+         	# and set the bailout variable
+         	set endofstring $sizeofstring
+         	set stayinloop 0
+      	}
+	
+      	# Get the range
+      	set outputline [string range $longstring $startofstring $endofstring]
+	
+      	# Adjust our range window
+      	set startofstring [expr $startofstring+$maxstringprintsize+1]
+      	set endofstring [expr $startofstring+$maxstringprintsize]
+	
+			runsudo none "$shellcommand -c \"echo \'$outputline\\c\' >> $memolog\""
+   	}
+	}
+}
+
+# Get file
+proc getfile {} {
+	global username password ftp prompt localhostip hostname getfilename userhome pwd
+
+	proc getfilesub1 {} {
+		global username password prompt ftp ftpbase localhostip getfilename pwd
+
+		send -- "$ftp $localhostip\r"
+
+		expect_before -re "T: unknown option" {
+			send -- "$ftpbase $localhostip\r"
+			exp_continue
+		}
+		expect {
+			-re "Name.*" {
+				send -- "$username\r"
+				expect -re "assword.*"
+				send -- "$password\r"
+				expect -re ">.*"
+				send -- "bin\r"
+				expect -re ">.*"
+				send -- "hash\r"
+				expect -re ">.*"
+				send -- "cd $pwd\r"
+				expect -re ">.*"
+				send -- "get $getfilename\r"
+				expect -re ">.*"
+				send -- "bye\r"
+				expect -re $prompt
+			} timeout {
+				sendlog "Error: ftp connection failed to $localhostip\n"
+				send -- "bye\r"
+			} eof {
+				sendlog "Error: ftp connection failed to $localhostip\n"
+				send -- "bye\r"
+			} -re "imeout" {
+				sendlog "Error: ftp connection timeout to $localhostip\n"
+			} -re "onnection refused" {
+				sendlog "Error: ftp connection refused to $localhostip\n"
+				send -- "bye\r"
+			} -re "unknown host" {
+				sendlog "Error: ftp connection unknown host to $localhostip\n"
+				send -- "bye\r"
+			}
+		}
+		send -- "cd ~$username\r"
+		expect -re $prompt
+		expect_before
+	}
+	
+	if 0==[catch {set tempcksum [exec cksum $getfilename]} errormessage] {
+		if {[regexp "^(\[0-9]+)\[^0-9]+" $tempcksum null localfilecksum]} {
+
+			send -- "file $getfilename\n"
+
+			expect_before {
+				-re "(executable|ascii text)" {
+					send -- "cksum $getfilename\r"
+					expect -re "$getfilename\r\n(.+)\r\n.*$prompt" {
+						expect_before
+						if {[regexp "^(\[0-9]+)\[^0-9]+" $expect_out(1,string) null remotefilecksum]} {
+							if {$localfilecksum!=$remotefilecksum} {
+								puts "Files don't match (new: $localfilecksum old: $remotefilecksum) - Getting newer version."
+								getfilesub1
+							} else {
+								puts "\n$getfilename file is up to date!"
+							}
+						}
+					}
+				} -re "(o such file|cannot open)" {
+					expect_before
+					getfilesub1
+				}
+			}
+	
+			expect -re $prompt
+			expect_before
+		} else {
+			puts "Unable to match cksum value!"
+		}
+	} else {
+		puts "Unable to find $getfilename on localhost! $errormessage"
+	}
+
+	return 0
+}
+
+# Get the editsudoers.pl file
+proc geteditsudoersfile {} {
+	global username password ftp localhostip prompt ftpeditsudoersserver editsudoersfilename userhome
+
+	proc geteditsudoersfilesub1 {} {
+		global username password prompt ftp ftpbase ftpeditsudoersserver editsudoersfilename localhostip
+
+		send -- "mkdir ~$username/bin\r"
+		expect -re $prompt
+		send -- "cd ~$username/bin\r"
+		expect -re $prompt
+		send -- "$ftp $ftpeditsudoersserver\r"
+		expect_before -re "T: unknown option" {
+			send -- "$ftpbase $localhostip\r"
+			exp_continue
+		}
+		expect {
+			-re "Name.*" {
+				send -- "$username\r"
+				expect -re "assword.*"
+				send -- "$password\r"
+				expect -re ">.*"
+				send -- "bin\r"
+				expect -re ">.*"
+				send -- "hash\r"
+				expect -re ">.*"
+				send -- "cd bin\r"
+				expect -re ">.*"
+				send -- "get $editsudoersfilename\r"
+				expect -re ">.*"
+				send -- "bye\r"
+				expect -re $prompt
+				send -- "chmod 755 $editsudoersfilename\r"
+				expect -re $prompt
+			} timeout {
+				sendlog "Error: ftp connection failed to $localhostip\n"
+				send -- "bye\r"
+			} eof {
+				sendlog "Error: ftp connection failed to $localhostip\n"
+				send -- "bye\r"
+			} -re "imeout" {
+				sendlog "Error: ftp connection timeout to $localhostip\n"
+			} -re "onnection refused" {
+				sendlog "Error: ftp connection refused to $localhostip\n"
+				send -- "bye\r"
+			} -re "unknown host" {
+				sendlog "Error: ftp connection unknown host to $localhostip\n"
+				send -- "bye\r"
+			}
+		}
+		send -- "cd ~$username\r"
+		expect -re $prompt
+		expect_before
+	}
+	
+	if 0==[catch {set tempcksum [exec cksum $userhome/bin/editsudoers.pl]} errormessage] {
+		if {[regexp "^(\[0-9]+)\[^0-9]+" $tempcksum null localsudoerscksum]} {
+
+			send -- "file ~$username/bin/editsudoers.pl\n"
+
+			expect_before {
+				-re "(executable|ascii text)" {
+					send -- "cksum ./bin/editsudoers.pl\r"
+					expect -re "editsudoers.pl\r\n(.+)\r\n.*$prompt" {
+						expect_before
+						if {[regexp "^(\[0-9]+)\[^0-9]+" $expect_out(1,string) null remotesudoerscksum]} {
+							if {$localsudoerscksum!=$remotesudoerscksum} {
+								puts "Sudoers files don't match (new: $localsudoerscksum old: $remotesudoerscksum) - Getting newer version."
+								geteditsudoersfilesub1
+							} else {
+								puts "\neditsudoers.pl file is up to date!"
+							}
+						}
+					}
+				} -re "(o such file|cannot open)" {
+					expect_before
+					geteditsudoersfilesub1
+				}
+			}
+	
+			expect -re $prompt
+			expect_before
+		} else {
+			puts "Unable to match cksum value!"
+		}
+	} else {
+		puts "Unable to find editsudoers.pl on localhost! $errormessage"
+	}
+
+	return 0
+}
+
+# Compare a local list of users to remote servers
+proc userlistcompare {} {
+	global password prompt server log_file usepbrun sudocmd pbruncmd pbruncmd date usernamescompare
+
+	match_max 1000000
+
+	if {$usepbrun==1} {
+		send -- "$pbruncmd logins -utxo | awk -F: '{print \$1 \":\" \$8}'\r"
+	} else {
+		send -- "$sudocmd logins -utxo | awk -F: '{print \$1 \":\" $\8}'\r"
+	}
+
+	expect_before {
+		-re "assword:.*" {
+			log_file
+			send -- "$password\r"
+			exp_continue
+		} failed {
+			sendlog "Error: sudo failed on $server\n"
+		} -re "not found" {
+			# If the command is not found, wait for prompt then issue next command
+			expect -re $prompt {
+				if {$usepbrun==0} {
+					send -- "$pbruncmd logins -utxo | awk -F: '{print \$1 \":\" \$8}'\r"
+				} else {
+					sendlog "Error: Sudo not found on this server!!\r"
+				}
+			}
+			if {$usepbrun==0} {
+				incr usepbrun
+				exp_continue
+			}
+		} -re "error" {
+			sendlog "Error: there is an error in the sudoers file on $server\n"
+		}
+	}
+
+	expect -re $prompt { 
+		foreach line [split $expect_out(buffer) "\r\n"] {
+			if {[regexp "(.+):PS" $line null tempusername]} {
+				foreach tempusernamecmp [array names usernamescompare] {
+					if {[string compare $tempusernamecmp $tempusername] == 0} {
+						append outputline " $tempusername"
+					}
+				}
+			}
+		}
+	}
+
+	# Empty the expect_before buffer so we don't get false matches on it.
+	expect_before 
+
+	if {[info exists outputline]} {
+		# Open file to append and create if now exists (plus read, but we don't need that here)
+		set outputfile [open ~/usercompare-$date.txt a+]
+		puts $outputfile "$server: $outputline"
+		close $outputfile
+	}
+
+	return 0
+}
+
+# Audit users process
+proc auditunusedaccounts {} {
+	global password prompt server log_file date usesudonoshelworkaround
+
+	match_max 1000000
+
+    if {$usesudonoshelworkaround} {
+        # Work around sudo limitation on shells
+        send -- "rm /tmp/connectshell\r"
+        expect -re $prompt
+        send -- "ln -s /bin/ksh /tmp/connectshell\r"
+        expect -re $prompt
+        runsudo none "/tmp/connectshell -c 'echo EndOfCommand; /tmp/connectshell'"
+        send -- "logins -utxo | awk -F: '{print \$1 \":\" \$8}'\r"
+    } else {
+        runsudo notransfer "logins -utxo | awk -F: '{print \$1 \":\" \$8}'"
+    }
+        expect -re $prompt { 
+		foreach line [split $expect_out(buffer) "\r\n"] {
+			if {[regexp "(.+):PS" $line null tempusername]} {
+				set userarray($tempusername) 1
+			} elseif {[regexp "(.+):LK" $line null tempusername]} {
+                set userarray($tempusername) 2
+		    }
+	    }
+    }
+
+	if {[array size userarray] > 0} {
+		foreach tempusername [array names userarray] {
+			set foundentry 0
+            
+			send -- "finger -swmf $tempusername | head -1\r"
+			expect -re $prompt {
+				foreach line [split $expect_out(buffer) "\r\n"] {
+					if {[regexp "$tempusername.+<\[\. ]+>" $line null lastlogindate]} {
+						set lastarray($tempusername) "Never logged in"
+						incr foundentry
+					} elseif {[regexp "$tempusername.+<(\[^<>]+)>" $line null lastlogindate]} {
+						set lastarray($tempusername) $lastlogindate
+						incr foundentry
+					} elseif {[regexp "$tempusername.+((Mon|Tue|Wed|Thu|Fri|Sat|Sun) +\[0-9:]+)" $line null lastlogindate]} {
+						set lastarray($tempusername) $lastlogindate
+						incr foundentry
+					}
+				}
+            }
+
+			if {$foundentry==0} {
+				unset userarray($tempusername)
+			}
+
+			set foundentry 0
+
+			send -- "egrep '^$tempusername:' /etc/passwd | awk -F: '{print \"Username:\" \$5 \":\"}'\r"
+            expect -re $prompt {
+                foreach line [split $expect_out(buffer) "\r\n"] {
+                    if {[regexp "Username:(\[^\"]*):" $line null fullusername]} {
+                        set usernamearray($tempusername) $fullusername
+						incr foundentry
+                    }
+                }
+            }
+
+			if {$foundentry==0} {
+                set usernamearray($tempusername) ''
+            }
+
+			set foundentry 0
+
+            if {$usesudonoshelworkaround} {
+                send -- "passwd -s $tempusername | awk '{print \$1 \":\" \$3 \":\" \$4 \":\" \$5 \":\" \$6}'\r"
+            } else {
+                runsudo notransfer "passwd -s $tempusername | awk '{print \$1 \":\" \$3 \":\" \$4 \":\" \$5 \":\" \$6}'"
+            }
+            expect -re $prompt {
+                foreach line [split $expect_out(buffer) "\r\n"] {
+                    if {[regexp "$tempusername:(\[^\"]+:\[^\"]+:\[^\"]+:\[^\"]+)" $line null passinfo]} {
+                        set passinfoarray($tempusername) $passinfo
+						incr foundentry
+                    }
+                }
+            }
+
+			if {$foundentry==0} {
+                set passinfoarray($tempusername) "n/a:::"
+            }
+
+			set foundentry 0
+
+            if {$usesudonoshelworkaround} {
+                send -- "ls -ld ~$tempusername | awk '{print \"StartOfList:$tempusername:\" \$6, \$7, \$8 \":EndOfList\"}'\r"
+            } else {
+                runsudo notransfer "ls -ld ~$tempusername | awk '{print \"StartOfList:$tempusername:\" \$6, \$7, \$8 \":EndOfList\"}'"
+            }
+            expect -re $prompt {
+                foreach line [split $expect_out(buffer) "\r\n"] {
+                    if {[regexp "StartOfList:$tempusername:(\[^\"]+):EndOfList" $line null homedirdate]} {
+                        set homedirdatearray($tempusername) $homedirdate
+						incr foundentry
+                    }
+                }
+            }
+
+			if {$foundentry==0} {
+                set homedirdatearray($tempusername) "n/a"
+            }
+    
+		}
+	
+		# Open file to append and create if now exists (plus read, but we don't need that here)
+		set outputfile [open useraudit-$server-$date.txt a+]
+
+        puts $outputfile "Server:Status:Username:Full Name:Last Password Change:Min:Max:Warn:Last Login Info:Home Dir Date\r"
+	
+		foreach tempusername [array names userarray] {
+            if {$userarray($tempusername)==1} {
+			    puts $outputfile "$server:active:$tempusername:$usernamearray($tempusername):$passinfoarray($tempusername):$lastarray($tempusername):$homedirdatearray($tempusername)\r"
+            } elseif {$userarray($tempusername)==2} {
+			    puts $outputfile "$server:locked:$tempusername:$usernamearray($tempusername):n/a::::$lastarray($tempusername):$homedirdatearray($tempusername)\r"
+			}
+        }
+	
+		close $outputfile
+	}
+
+    if {$usesudonoshelworkaround} {
+        send -- "exit\r"
+        expect -re $prompt
+        send -- "rm /tmp/connectshell\r"
+        expect -re $prompt
+    }
+
+	return 0
+}
+
+# Modify the sudoers file
+proc updatesudoers {} {
+	global log_file prompt date updatesudoersarray server memolog sudocmd pbruncmd usepbrun username usesudonoshelworkaround
+	set sudoersfile "/etc/sudoers"
+	set dontexit 0
+
+	# Adjust our timeout as this takes a long time to run
+	set timeout -1
+
+	send -- "pkginfo | grep sudo\r";
+
+	expect_before {
+		-re "CSWsudo" {
+			# Our files are in /opt/csw/etc/
+			set sudoersfile "/opt/csw/etc/sudoers"
+			exp_continue
+		} -re "SMCsudo" {
+			# Our files are in /usr/local/etc/
+			set sudoersfile "/usr/local/etc/sudoers"
+			exp_continue
+		} -re "SFWsudo" {
+			# Our files are in /opt/sfw/etc
+			set sudoersfile "/opt/sfw/etc/sudoers"
+			exp_continue
+		} -re "CUsudo" {
+			# Our files are in /etc
+			set sudoersfile "/etc/sudoers"
+			exp_continue
+		}
+	}
+
+	expect -re $prompt
+	expect_before
+
+	# Make a backup copy of the existing sudoers file
+	if 0==[runsudo none "cp $sudoersfile $sudoersfile.backup.$date"] {
+	
+		# Make a temporary copy of the existing sudoers file
+		runsudo none "cp $sudoersfile.backup.$date $sudoersfile.temp.$date"
+	
+		# Some error checking to make sure the file is there before we touch it.
+		send -- "ls $sudoersfile.temp.$date\r"
+	
+		# Set the path for sudo
+		if {$usepbrun==1} {
+			set sudocommand "$pbruncmd"
+		} else {
+			set sudocommand "$sudocmd"
+		}
+	
+		expect {
+			-re ".*((N|n)o such|not found)" {
+				sendlog "Error reading $sudoersfile.temp.$date!!!"
+			} -re "ls $sudoersfile.temp.$date.*$sudoersfile.temp.$date" {
+				# Retrieve entries out of the array to process
+				foreach sudoerscounter [array names updatesudoersarray] {
+					set temparray $updatesudoersarray($sudoerscounter)
+					set listarray [split $temparray ":"]
+					set tempusername [lindex $listarray 0]
+					set sudoersgroup [lindex $listarray 1]
+					set sudoersoperation [lindex $listarray 2]
+			
+					# Note: The below commands have some SERIOUS limitations with regards to the following:
+					#		1) Multiline groups:  Only the first line of the group is matched, thus adding
+					#			users to other lines that belong to the same group is not supported.
+					#		2) Deleting users in multiline groups: This function will not properly detect
+					#			a users group membership <period>.
+					#		3) All instances of the user will be deleted from the sudoers file.  Again
+					#			I could try to do some checking, but a better soultion, IMHO, would be
+					#			a local script to admin the users entries.
+					#		4) Tabs before/after user entries.  Expect doesn't like sending the actual tabs,
+					#			so, I've had to remove them from the script.
+					#	I would really like to write a perl script to handle local sudoers modification. 
+					#	Although I could do it in expect, it would be too slow to handle all the IO, and
+					#	I like Perls handling of strings better than expect.
+					if {[string compare $sudoersoperation "add"] == 0} {
+						# Add user
+						sendlog "Adding $tempusername to group: $sudoersgroup on $server\n"
+			
+						runsudo none "sed 's/^\\(User_Alias.*$sudoersgroup=\\)/\\1$tempusername,/' $sudoersfile.temp.$date > /tmp/sudoers.new.$date"
+			
+						runsudo none "chown root:root /tmp/sudoers.new.$date"
+						runsudo none "chmod 440 /tmp/sudoers.new.$date"
+			
+						runsudo none "mv /tmp/sudoers.new.$date $sudoersfile.temp.$date"
+	
+						append addsudoerslist " $tempusername\($sudoersgroup\)"
+					} elseif {[string compare $sudoersoperation "delete"] == 0} {
+						# Delete user
+						sendlog "Deleting sudoers access for $tempusername on $server\n"
+			
+						# Working Sed Command:
+						# sed -e 's/,user,/,/' -e 's/\([  ,=]\{1,\}\)user[        ,]\{1,\}/\1/' -e 's/[   ,]\{1,\}user$//' -e 's/,user\([      \\]\)\{1,\}/\1/' <filename>
+						#        <1st expression> <2nd expression>                                 <3rd expression>                  <4th expression>
+						# Note: The <tab> character is created using 'Ctrl-v Ctrl-i'
+						#
+						# Cases:
+						#  User_Alias GROUP=user									; none; this breaks sudoers
+						#  User_Alias GROUP=notthisuser,user					; 3rd expression
+						#  User_Alias GROUP=notthisuser,user \					; 4th expression
+						#  User_Alias GROUP=notthisuser,user\					; 4th expression
+						#  User_Alias GROUP=notthisuser,user,notthisuser	; 1st expression
+						#  					user										; 3rd expression or 2nd if tab/space after
+						#  					user,nothisuser						; 2nd expression
+			
+						# Run sed with 4 expressions
+			#			runsudo none "sed -e 's/,$tempusername,/,/' -e 's/\\(\[ 	,=\]\\{1,\\}\\)$tempusername\[ 	,\]\\{1,\\}/\\1/' -e 's/\[ 	,\]\\{1,\\}$tempusername\$//' -e 's/,$tempusername\\(\[\\\ 	\]\\{1,\\}\\)/\\1/' $sudoersfile.temp.$date > $sudoersfile.new.$date"
+						# Because expect doesn't like sending the tabs.
+						runsudo none "sed -e 's/,$tempusername,/,/' -e 's/\\(\[ ,=\]\\{1,\\}\\)$tempusername\[ ,\]\\{1,\\}/\\1/' -e 's/\[ ,=\]\\{1,\\}$tempusername\$//' -e 's/,$tempusername\\(\[\\\ \]\\{1,\\}\\)/\\1/' $sudoersfile.temp.$date > /tmp/sudoers.new.$date"
+			
+						runsudo none "chown root:root /tmp/sudoers.new.$date"
+						runsudo none "chmod 440 /tmp/sudoers.new.$date"
+			
+						runsudo none "mv /tmp/sudoers.new.$date $sudoersfile.temp.$date"
+	
+						append deletesudoerslist " $tempusername"
+					}	
+				}
+	
+				# Update memolog entries
+				if {[info exists addsudoerslist]} {
+					# Work around sudo limitation on shells
+					if {$usesudonoshelworkaround} {
+						send -- "ln -s /bin/sh /tmp/connectshell\r"
+						expect -re $prompt
+						runsudo none "/tmp/connectshell -c \"echo \'$date-$username-Updated $sudoersfile added:\\c\' >> $memolog\""
+						printmemolog "/tmp/connectshell" $addsudoerslist
+						runsudo none "/tmp/connectshell -c \"echo \'    Backup is $sudoersfile.backup.$date\' >> $memolog\""
+						runsudo none "/tmp/connectshell -c \"echo \'-----------------------------------------------------------\' >> $memolog\""
+						send -- "rm /tmp/connectshell\r"
+						expect -re $prompt
+					} else {
+						runsudo none "sh -c \"echo \'$date-$username-Updated $sudoersfile added:\\c\' >> $memolog\""
+						printmemolog "sh" $addsudoerslist
+						runsudo none "sh -c \"echo \'    Backup is $sudoersfile.backup.$date\' >> $memolog\""
+						runsudo none "sh -c \"echo \'-----------------------------------------------------------\' >> $memolog\""
+					}
+				}
+	
+				if {[info exists deletesudoerslist]} {
+					if {$usesudonoshelworkaround} {
+						# Work around sudo limitation on shells
+						send -- "ln -s /bin/sh /tmp/connectshell\r"
+						expect -re $prompt
+						runsudo none "/tmp/connectshell -c \"echo \'$date-$username-Updated $sudoersfile removed:\\c\' >> $memolog\""
+						printmemolog "/tmp/connectshell" $deletesudoerslist
+						runsudo none "/tmp/connectshell -c \" echo \'    Backup is $sudoersfile.backup.$date\' >> $memolog\""
+						runsudo none "/tmp/connectshell -c \"echo \'-----------------------------------------------------------\' >> $memolog\""
+						send -- "rm /tmp/connectshell\r"
+						expect -re $prompt
+					} else {
+						runsudo none "sh -c \"echo \'$date-$username-Updated $sudoersfile removed:\\c\' >> $memolog\""
+						printmemolog "sh" $deletesudoerslist
+	 					runsudo none "sh -c \"echo \'    Backup is $sudoersfile.backup.$date\' >> $memolog\""
+						runsudo none "sh -c \"echo \'-----------------------------------------------------------\' >> $memolog\""
+					}
+				}
+			
+				# Become root, so we can check the config
+				# Note: Secure systems don't allow the calling of shells or su, so this will fail.
+				#		But, the cp line should still work, assuming root is allowed ALL commands
+				#		in sudoers file, which is default.
+				if {$usesudonoshelworkaround} {
+					# Work around sudo limitation on shells
+					send -- "ln -s /bin/sh /tmp/connectshell\r"
+					expect_before -re "(cannot create|Permission (D|d)enied)" {
+						set dontexit 1
+					}
+	
+					expect -re $prompt
+					expect_before
+	
+					if { $dontexit != 1 } {
+						runsudo none "/tmp/connectshell"
+					}
+				} else {
+					runsudo none "su"
+				}
+	
+				# Copy the newly created sudoers file into place
+				runsudo notransfer "cp $sudoersfile.temp.$date $sudoersfile"
+	
+				# If root can't run sudo, then we'll assume we have a rootshell
+				expect_before -re "(may not run|is not in the sudoers)" {
+					send -- "cp $sudoersfile.temp.$date $sudoersfile\r"
+					expect -re $prompt
+				}
+	
+				expect -re $prompt
+				expect_before
+			
+				# Check the config
+				send -- "$sudocommand -l\r"
+				expect_before -re "(zero|error)" {
+						sendlog "Error in sudoers config on $server!!\n"
+						send -- "cp $sudoersfile.backup.$date $sudoersfile\r"
+					}
+			
+				expect -re $prompt
+				expect_before
+			
+				if {$usesudonoshelworkaround && $dontexit != 1} {
+					# Leave the workaround sudo shell
+					send -- "exit\r"
+					expect -re $prompt
+					send -- "rm /tmp/connectshell\r"
+					expect -re $prompt
+				}
+			
+			}
+		}
+	}
+
+	# Empty the expect_before buffer
+	expect_before
+
+	return 0
+}	
+
+# Administrate users
+proc adminusers {} {
+	global log_file prompt date updateuseradminarray server memolog usepbrun defaultuserpass sudocmd pbruncmd useradmindefaulthome useradmindefaultgroup useradmindefaultshell username usesudonoshelworkaround noaccountexpiry osname noforcepasswordchange centrifyaware centrifyadusername centrifyadpassword
+
+    set usecentrifyshellcommands 0
+    set cdcshellfunctionspath "/usr/share/centrifydc/cdc_shell_functions.sh"
+
+    send -- "test -x /usr/bin/adinfo && echo AdinfoFound || echo AdinfoNotfound\r"
+
+    expect {
+        -re "\r\nAdinfoNotfound.*$prompt" {
+        }
+        -re "\r\nAdinfoFound.*$prompt" {
+            # 2/18/08 - Section updates made to handle account administration within a Centrified environment.
+            #
+            # Process to follow is as follows:
+            #  1 - Identify the Centrify Zone DN using the 'adinfo -z' command
+            #    a - skip if this is the 'global' zone.
+            #    b - create the DN from the returned info
+            #  2 - Use 'kinit' to authenticate as the admin account
+            #  3 - Source in the Centrify shell commands
+            #  4 - Perform the 'add_user' command via centrify
+
+            # If the use of Centrify commands was requested, 
+            # indicate to use the appropriate commands
+            if {$centrifyaware==0} {
+                sendlog "Adinfo found on system, bypassing useradd\n"
+                return 0
+            } else {
+                puts "Using Centrify shell commands"
+                set usecentrifyshellcommands 1
+
+                # Capture the DN for the server
+                send -- "adinfo -z \| awk '\{print \"ADInfoOutput:\" \$1 \":ADInfoOutputEnd\"\}'\r"
+
+                expect -re "ADInfoOutput:(\[a-zA-Z0-9_\.\/]+):ADInfoOutputEnd.*$prompt"
+                set adinfooutput $expect_out(1,string)
+
+                if {[regexp "^(\[a-zA-Z0-9]+)\.(\[a-zA-Z0-9]+)\.(\[a-zA-Z0-9]+)\/UNIX\/Zones\/(\[a-zA-Z0-9]+)\/(\[a-zA-Z0-9]+)\/(\[a-zA-Z0-9_]+)\$" $adinfooutput null dompart1 dompart2 dompart3 zonetype adzone adserver]} {
+                    # Reset this value for use later in testing
+                    set adinfooutput 1
+
+                    # Exit add function if we are in the Global zone
+                    if {$adserver=="Global"} {
+                        return 0
+                    }
+                }
+            }
+        }
+    }
+    
+    # Retrieve entries out of the array to process
+    foreach tempusername [array names updateuseradminarray] {
+        set temparray $updateuseradminarray($tempusername)
+        set listarray [split $temparray ":"]
+        set useruid [lindex $listarray 0]
+        set usergid [lindex $listarray 1]
+        set usergcos [lindex $listarray 2]
+       
+        # Change how the elements are retrieved from the array
+        # if this is a Centrify user list
+        if {$centrifyaware==0} { 
+            set useroperation [lindex $listarray 3]
+        } else {
+            set usercentrifycn [lindex $listarray 3]
+            set useroperation [lindex $listarray 4]
+        }
+
+        send -- "\r"
+        expect -re $prompt
+
+        # Add the user
+        if {[string compare $useroperation "add"] == 0} {
+
+        # Check to see if the user exists and parse the return information
+        send -- "id $tempusername\r"
+
+        expect {
+   			-re "(No such user|invalid user|an.t find user)" {
+   				expect -re $prompt
+   				set addfail 0
+
+                # Add the account
+                if { $useruid=="none"
+                    && $usergid=="none"
+                    && $usecentrifyshellcommands==0 } {
+                    if 0==[runsudo notransfer "useradd -c \"$usergcos\" -d $useradmindefaulthome/$tempusername -m -g $useradmindefaultgroup -s $useradmindefaultshell $tempusername"] {
+                        expect_before {
+                            -re "(failed|invalid)" {
+                                sendlog "Error: failed to add user $tempusername on server: $server!!!\n"
+                                set addfail 1
+                                append faileduserlist " $tempusername\($usergcos\)"
+                            }
+                        }
+   
+                        expect -re $prompt
+                        expect_before
+                    } else {
+                        set addfail 1
+                        append faileduserlist " $tempusername\($usergcos\)"
+                    }
+                } elseif { [regexp "^\[0-9]+$" $useruid null]
+                    && [regexp "^\[0-9]+$" $usergid null]
+                    && $usecentrifyshellcommands==0 } {
+                    # Check to see if the desired group exists before adding the user to it
+                    send -- "egrep ':$usergid:' /etc/group \| wc -l \| awk '\{print \"Group Lines: \" \$1\}'\r"
+                    expect_before {
+                        -re "Group Lines: 0" {
+                            # The requested group id does not exist on the local system.
+                            # We will now set the group for this user to the default group.
+                            set usergid $useradmindefaultgroup
+                        }
+                        -re "Group Lines: 1" {
+                            # We found a matching group entry
+                        }
+                    }
+
+                    expect -re $prompt
+                    expect_before
+
+                    if 0==[runsudo notransfer "useradd -c \"$usergcos\" -d $useradmindefaulthome/$tempusername -m -u $useruid -g $usergid -s $useradmindefaultshell $tempusername"] {
+                        expect_before {
+                            -re "(failed|invalid)" {
+                                sendlog "Error: failed to add user $tempusername on server: $server!!!\n"
+                                set addfail 1
+                                append faileduserlist " $tempusername\($usergcos\)"
+                            }
+                        }
+   
+                        expect -re $prompt
+                        expect_before
+                    } else {
+                        set addfail 1
+                        append faileduserlist " $tempusername\($usergcos\)"
+                    }
+                } elseif { $usecentrifyshellcommands==1
+                    && $adinfooutput==1 } {
+                    # Test to see if the CDC Shell Functions are available before continuing
+                    send -- "test -f $cdcshellfunctionspath && echo CDCShellFunctionsFileFound || echo CDCShellFunctionsFileNotFound\r"
+
+                    expect {
+                        -re "\r\nCDCShellFunctionsFileNotFound.*$prompt" {
+                            # Unable to locate the CDC Shell Functions File!!!
+                            send_user "Error: Unable to locate the CDC Shell Functions File: $cdcshellfunctionspath!\r"
+                            send_log "Error: Unable to locate the CDC Shell Functions File: $cdcshellfunctionspath!\r"
+                            set addfail 1
+                            append faileduserlist " $tempusername\($usergcos\)"
+                            return 0
+                        } -re "\r\nCDCShellFunctionsFileFound.*$prompt" {
+                            # Add the account to the Centrify AD Process
+                            set adddn "CDC_API_ZONE=cn=$adserver,cn=$adzone,cn=$zonetype,ou=zones,ou=unix,dc=$dompart1,dc=$dompart2,dc=$dompart3"
+
+                            # Initialize the users Kerberos credentials for use with
+                            # account provisioning
+                            send -- "/usr/share/centrifydc/kerberos/bin/kinit $centrifyadusername\r"
+
+                            expect_before -re "assword for $centrifyadusername.*:" {
+                                send -- "$centrifyadpassword\r"
+                                exp_continue
+                            }
+
+                            expect -re $prompt
+                            expect_before
+
+                            # Check the return status of the last command to verify that it didn't error
+                            send -- "echo $? \| awk '\{print \"ExecutionStatusStart:\" \$1 \":ExecutionStatusEnd\"\}'\r"
+                            expect_before -re "ExecutionStatusStart:1:ExecutionStatusEnd.*$prompt" {
+                                send_user "Error authenticating user $centrifyadusername!!!\r"
+                                sendlog "Error authenticating user $centrifyadusername!!!\r"
+                                set addfail 1
+                                append faileduserlist " $tempusername\($usergcos\)"
+                                return 0
+                            }
+
+                            expect -re $prompt
+                            expect_before
+
+                            # Verify that the AD credentials are listed in the current Kerberos keys list
+                            send -- "/usr/share/centrifydc/kerberos/bin/klist \| grep 'Default principal: $centrifyadusername' \| wc -l \| awk '\{print \"ExecutionStatusStart:\" \$1 \":ExecutionStatusEnd\"\}'\r"
+                            expect_before -re "ExecutionStatusStart:0:ExecutionStatusEnd.*$prompt" {
+                                send_user "Error authenticating user $centrifyadusername!!!\r"
+                                sendlog "Error authenticating user $centrifyadusername!!!\r"
+                                set addfail 1
+                                append faileduserlist " $tempusername\($usergcos\)"
+                                return 0
+                            }
+
+                            expect -re $prompt
+                            expect_before
+    
+                            # At this point, we have satisfied the checks and are ready to add the user
+    
+                            # Lets start a new shell that will allow us to import the functions we need
+                            send -- "/bin/ksh\r"
+                            expect -re $prompt
+    
+                            # Set the DN
+                            send -- "export $adddn\r"
+                            expect -re $prompt
+    
+                            # Source in the CDC Shell Functions from the file as ksh specific
+                            send -- ". $cdcshellfunctionspath\r"
+                            expect -re $prompt
+
+                            # Set a counter for the found users
+                            set foundaduser 0
+
+                            # Check that the user doesn't already exist before continuing
+                            send -- "list_users \| grep -i 'cn=$tempusername' \| wc -l \| awk '\{print \"ExecutionStatusStart:\" \$1 \":ExecutionStatusEnd\"\}'\r"
+    
+                            expect_before -re "ExecutionStatusStart:0:ExecutionStatusEnd.*$prompt" {
+                                set foundaduser 1
+                            }
+
+                            expect -re $prompt
+                            expect_before
+                        
+                            if {$foundaduser==1} {
+   		
+   					            # Log updates
+           					    sendlog "Attempting to add username $tempusername with gcos of \"$usergcos\" on $server\n"
+
+                                # Add the user
+                                send -- "add_user $tempusername $usercentrifycn $useruid $usergid $useradmindefaulthome/$tempusername $useradmindefaultshell\r"
+                                expect -re $prompt
+    
+                                # Check the return status of the last command to verify that it didn't error
+                                send -- "echo $? \| awk '\{print \"ExecutionStatusStart:\" \$1 \":ExecutionStatusEnd\"\}'\r"
+                                expect_before -re "ExecutionStatusStart:1:ExecutionStatusEnd.*$prompt" {
+                                    send_user "Error adding user $tempusername!!!\r"
+                                    sendlog "Error adding user $tempusername!!!\r"
+                                    set addfail 1
+                                    append faileduserlist " $tempusername\($usergcos\)"
+                                    return 0
+                                } -re "ExecutionStatusStart:68:ExecutionStatusEnd.*$prompt" {
+                                    send_user "Error adding user $tempusername user already exists!!\r"
+                                    sendlog "Error adding user $tempusername user already exists!!!\r"
+                                    set addfail 1
+                                    append faileduserlist " $tempusername\($usergcos\)"
+                                    return 0
+                                } -re "ExecutionStatusStart:2:ExecutionStatusEnd.*$prompt" {
+                                    send_user "Request to add user $tempusername on server $server rejected by Centrify!!!\r"
+                                    sendlog "Request to add user $tempusername on server $server rejected by Centrify!!!\r"
+                                    set addfail 1
+                                    append faileduserlist " $tempusername\($usergcos\)"
+                                    return 0
+                                }
+
+                                expect -re $prompt
+                                expect_before
+                            } else {
+                                send_user "Error adding user $tempusername user already exists!!\r"
+                                sendlog "Error adding user $tempusername user already exists!!!\r"
+                            }
+    
+                            # Exit out of the korneshell that was started earlier
+                            send -- "exit\r"
+                            expect -re $prompt
+                            }
+
+       					    append adduserlist " $tempusername\($usergcos\)"
+                        }
+                    } else {
+                        set addfail 1
+                        append faileduserlist " $tempusername\($usergcos\)"
+                    }
+
+   				    # Only process the following if we didn't get a fail on the useradd command
+   				    if {$addfail==0 && $usecentrifyshellcommands==0} {
+   					    # Set the path for sudo
+                        if {$username=="root"} {
+                            set sudocommand ""
+   					    } elseif {$usepbrun==1} {
+                            # Cache sudo
+                            runsudo none "-v"
+
+   						    set sudocommand "$pbruncmd"
+   					    } else {
+                            # Cache sudo
+                            runsudo none "-v"
+
+   						    set sudocommand "$sudocmd"
+   					    }
+
+   					    # Set the password
+					    # SunOS specific
+                        if {$osname=="SunOS"} {
+                            send -- "$sudocommand passwd -r files $tempusername\r"
+                        } else {
+                            send -- "$sudocommand passwd $tempusername\r"
+                        }
+   
+   					    expect_before {
+   						    -re "(N|n)ew (P|p)assword\[:,]" {
+   							    send -- "$defaultuserpass\r"
+   							    exp_continue
+   						    } -re "(R|r)e.*enter (N|n)ew (P|p)assword" {
+   							    send -- "$defaultuserpass\r"
+   							    exp_continue
+                            } -re "Enter choice.*" {
+                                send -- "p\r"
+                                exp_continue
+   						    } -notransfer "*not found*" {
+   							    sendlog "Error: passwd not found on $server\n"
+   						    } -notransfer "*error*" {
+   							    sendlog "Error: there is an error with passwd on $server\n"
+   						    } -notransfer "*denied*" {
+   							    sendlog "Error: there is an error with passwd on $server\n"
+   						    }
+   					    }
+   
+   					    expect -re $prompt
+   					    expect_before
+   		
+   					    # Log updates
+   					    sendlog "Adding $tempusername with gcos of \"$usergcos\" on $server\n"
+
+   					    if { $noaccountexpiry == 0 } {
+   						    # SunOS specific
+   						    if {$osname=="SunOS"} {
+   							    # Set default account expiry
+   							    runsudo none "passwd -r files -n 2 -w 3 -x 120 $tempusername"
+   		    
+   							    if { $noforcepasswordchange == 0 } {
+   								    # Set account to reset password on login
+   								    runsudo none "passwd -r files -f $tempusername"
+   							    }
+   						    } else {
+   							    # Set default account expiry
+   							    runsudo none "passwd -n 2 -w 3 -x 120 $tempusername"
+   		    
+   							    if { $noforcepasswordchange == 0 } {
+   								    # Set account to reset password on login
+   								    runsudo none "passwd -f $tempusername"
+   							    }
+   						    }
+   					    } else {
+   						    if {$osname=="SunOS"} {
+    
+   							    if { $noforcepasswordchange == 0 } {
+   								    # Set account to reset password on login
+   								    runsudo none "passwd -r files -f $tempusername"
+   							    }
+   						    } else {
+   							    if { $noforcepasswordchange == 0 } {
+   								    # Set account to reset password on login
+   								    runsudo none "passwd -f $tempusername"
+   							    }
+                            }
+                        }
+   		    
+   					    append adduserlist " $tempusername\($usergcos\)"
+   				    }
+		        } -notransfer -re ".*=.*$tempusername.*" {
+                    expect -re $prompt
+                    sendlog "User $tempusername already exists on $server\n"
+                }
+            }
+       } elseif {[string compare $useroperation "delete"] == 0} {
+   	    # Log updates
+   	    sendlog "Deleting $tempusername on $server\n"
+
+   	    # Delete user
+   	    runsudo none "userdel -r $tempusername"
+
+   	    append deleteuserlist " $tempusername\($usergcos\)"
+       } elseif {[string compare $useroperation "lock"] == 0} {
+   	    # Log updates
+   	    sendlog "Locking account $tempusername on $server\n"
+
+   	    # Lock the password for the account
+	    # SunOS specific
+        if {$osname=="SunOS"} {
+   	        runsudo none "passwd -r files -l $tempusername"
+        } else {
+   	        runsudo none "passwd -l $tempusername"
+        }
+
+   	    append lockuserlist " $tempusername\($usergcos\)"
+       }
+   }
+
+    if {[info exists faileduserlist]} {
+        sendlog "The following account(s) were NOT added on $server: $faileduserlist"
+    }
+
+   if {[info exists adduserlist]} {
+   	if {$usesudonoshelworkaround} {
+   		# Work around sudo limitation on shells
+   		send -- "ln -s /bin/sh /tmp/connectshell\r"
+   		expect -re $prompt
+   		runsudo none "/tmp/connectshell -c \"echo \'$date-$username-Added user account(s):\\c\' >> $memolog\""
+   		printmemolog "/tmp/connectshell" $adduserlist
+   		runsudo none "/tmp/connectshell -c \"echo \'\\n-----------------------------------------------------------\' >> $memolog\""
+        sendlog "Added user account(s) on $server: $adduserlist"
+   		send -- "rm /tmp/connectshell\r"
+   		expect -re $prompt
+   	} else {
+   		runsudo none "sh -c \"echo \'$date-$username-Added user account(s):\\c\' >> $memolog\""
+   		printmemolog "sh" $adduserlist
+   		runsudo none "sh -c \"echo \'\\n-----------------------------------------------------------\' >> $memolog\""
+        sendlog "Added user account(s) on $server: $adduserlist"
+   	}
+   } elseif {[info exists deleteuserlist]} {
+   	if {$usesudonoshelworkaround} {
+   		# Work around sudo limitation on shells
+   		send -- "ln -s /bin/sh /tmp/connectshell\r"
+   		expect -re $prompt
+   		runsudo none "/tmp/connectshell -c \"echo \'$date-$username-Deleted user account(s):\\c\' >> $memolog\""
+   		printmemolog "/tmp/connectshell" $deleteuserlist
+   		runsudo none "/tmp/connectshell -c \"echo \'\\n-----------------------------------------------------------\' >> $memolog\""
+        sendlog "Deleted user account(s) on $server: $adduserlist"
+   		send -- "rm /tmp/connectshell\r"
+   		expect -re $prompt
+   	} else {
+   		runsudo none "sh -c \"echo \'$date-$username-Deleted user account(s):\\c\' >> $memolog\""
+   		printmemolog "sh" $deleteuserlist
+   		runsudo none "sh -c \"echo \'\\n-----------------------------------------------------------\' >> $memolog\""
+        sendlog "Deleted user account(s) on $server: $adduserlist"
+   	}
+   } elseif {[info exists lockuserlist]} {
+   	if {$usesudonoshelworkaround} {
+   		# Work around sudo limitation on shells
+   		send -- "ln -s /bin/sh /tmp/connectshell\r"
+   		expect -re $prompt
+   		runsudo none "/tmp/connectshell -c \"echo \'$date-$username-Locked user account(s):\\c\' >> $memolog\""
+   		printmemolog "/tmp/connectshell" $lockuserlist
+   		runsudo none "/tmp/connectshell -c \"echo \'\\n-----------------------------------------------------------\' >> $memolog\""
+        sendlog "Locked user account(s) on $server: $adduserlist"
+   		send -- "rm /tmp/connectshell\r"
+   		expect -re $prompt
+   	} else {
+   		runsudo none "sh -c \"echo \'$date-$username-Locked user account(s):\\c\' >> $memolog\""
+   		printmemolog "sh" $lockuserlist
+   		runsudo none "sh -c \"echo \'\\n-----------------------------------------------------------\' >> $memolog\""
+        sendlog "Locked user account(s) on $server: $adduserlist"
+   	}
+   }
+
+	return 0
+}
+
+# Reset an account to the default password and expiry options 
+proc resetuserpassword {} {
+	global log_file prompt date server usepbrun defaultuserpass sudocmd pbruncmd username usesudonoshelworkaround osname passwordusername noaccountexpiry removeaccountexpiry randomnewpassword randomnewpasswordlogfile noforcepasswordchange
+
+	send -- "id $passwordusername\r"
+
+	if {$randomnewpassword==1} {
+		set NewPassword [GenerateNewPassword]
+	} else {
+		set NewPassword $defaultuserpass
+	}
+
+	# Keep us from accidentally resetting root's expiry.
+	if {$passwordusername=="root"} {
+		set noaccountexpiry 1
+	}
+
+	expect {
+		 -notransfer -re ".*=.*$passwordusername.*" {
+			expect -re $prompt
+
+				# Get Sudo cached
+     			runsudo none "-v"
+
+				# Set the path for sudo
+				if {$usepbrun==1} {
+					set sudocommand "$pbruncmd"
+				} else {
+					set sudocommand "$sudocmd"
+				}
+		
+				# Set the password
+                # SunOS specific
+                if {$osname=="SunOS"} {
+    				send -- "$sudocommand passwd -r files $passwordusername\r"
+                } else {
+				    send -- "$sudocommand passwd $passwordusername\r"
+                }
+
+				expect_before {
+					-re "(N|n)ew (P|p)assword\[:,]" {
+							send -- "$NewPassword\r"
+							exp_continue
+						} -re "(R|r)e.*enter (N|n)ew (P|p)assword" {
+							send -- "$NewPassword\r"
+							exp_continue
+                        } -re "Enter choice.*" {
+                            send -- "p\r"
+                            exp_continue
+						} -notransfer "*not found*" {
+							sendlog "Error: passwd not found on $server\n"
+						} -notransfer "*error*" {
+							sendlog "Error: there is an error with passwd on $server\n"
+						} -notransfer "*denied*" {
+							sendlog "Error: there is an error with passwd on $server\n"
+						}
+					}
+
+				expect -re $prompt
+		
+				if { $noaccountexpiry == 0 } {
+					# SunOS specific
+					if {$osname=="SunOS"} {
+						# Set default account expiry
+						runsudo none "passwd -r files -n 2 -w 3 -x 120 $passwordusername"
+	
+						if { $noforcepasswordchange == 0 } {
+							# Set account to reset password on login
+							runsudo none "passwd -r files -f $passwordusername"
+						}
+					} else {
+						# Set default account expiry
+						runsudo none "passwd -n 2 -w 3 -x 120 $passwordusername"
+	
+						if { $noforcepasswordchange == 0 } {
+							# Set account to reset password on login
+							runsudo none "passwd -f $passwordusername"
+						}
+					}
+                } else {
+                    if {$osname=="SunOS"} {
+                        if { $noforcepasswordchange == 0 } {
+                            # Set account to reset password on login
+                            runsudo none "passwd -r files -f $passwordusername"
+                        }
+                    } else {
+                        if { $noforcepasswordchange == 0 } {
+                            # Set account to reset password on login
+                            runsudo none "passwd -f $passwordusername"
+                        }
+                    }
+                }
+
+				if { $removeaccountexpiry == 1 } {
+					# SunOS specific
+					if {$osname=="SunOS"} {
+						# Remove default account expiry
+						runsudo none "passwd -r files -x -1 $passwordusername"
+	
+						if { $noforcepasswordchange == 0 } {
+							# Set account to reset password on login
+							runsudo none "passwd -r files -f $passwordusername"
+						}
+					} else {
+						# Remove default account expiry
+						runsudo none "passwd -n 0 -w 0 -x 0 $passwordusername"
+	
+						if { $noforcepasswordchange == 0 } {
+							# Set account to reset password on login
+							runsudo none "passwd -f $passwordusername"
+						}
+					}
+				}
+			} -re "(No such user|invalid user|an.t find user)" {
+				expect -re $prompt
+				sendlog "Unable to change password for user $passwordusername on $server - user id does not exist!\n"
+			}
+		}
+
+   if {[info exists randomnewpasswordlogfile]} {
+		set outputfile [open $randomnewpasswordlogfile a+]
+		puts $outputfile "$server:$date:$passwordusername:$NewPassword"
+		close $outputfile
+		}
+
+	return 0
+}
+
+# Process to generate new random passwords.
+proc GenerateNewPassword {} {
+	# This snippet of code is borrowed from NIST's origional 'mkpasswd' program.
+
+	# Global Values
+	global isleft
+
+	# Defaults
+	set length 9
+	set minnum 2
+	set minlower 2
+	set minupper 2
+	set minspecial 1
+	set verbose 0
+	set distribute 1
+
+	# Do some sanity checking on the combinations.
+	if {$minnum + $minlower + $minupper + $minspecial > $length} {
+		puts "impossible to generate $length-character password\
+			with $minnum numbers, $minlower lowercase letters,\
+			$minupper uppercase letters and\
+			$minspecial special characters."
+		exit 1
+	}
+
+	# If there is any underspecification, use additional lowercase letters
+	set minlower [expr {$length - ($minnum + $minupper + $minspecial)}]
+
+	set lpass ""		;# password chars typed by left hand
+	set rpass ""		;# password chars typed by right hand
+
+	# Insert char into password at a random position, thereby spreading
+	# the different kinds of characters throughout the password
+	proc passinsert {pvar char} {
+    	upvar $pvar p
+	
+    	set p [linsert $p [rand [expr {(1+[llength $p])}]] $char]
+	}
+
+	proc rand {m} {
+    	expr {int($m*rand())}
+	}
+
+	# Choose left or right starting hand
+	set initially_left [set isleft [rand 2]]
+
+	# Given a size, distribute between left and right hands
+	# taking into account where we left off
+	proc psplit {max lvar rvar} {
+		upvar $lvar left $rvar right
+		global isleft
+	
+		if {$isleft} {
+			set right [expr $max/2]
+			set left [expr $max-$right]
+			set isleft [expr !($max%2)]
+		} else {
+			set left [expr $max/2]
+			set right [expr $max-$left]
+			set isleft [expr $max%2]
+		}
+	}
+
+	# Set the keys available for each hand
+	set lkeys {q w e r t a s d f g z x c v b}
+	set rkeys {y u i o p h j k l n m}
+	set lnums {1 2 3 4 5 6}
+	set rnums {7 8 9 0}
+	set lspec {! @ # \$ %}
+	set rspec {^ & * ( ) - = _ + [ ] "{" "}" \\ | ; : ' \" < > , . ? /}
+	
+	set lkeys_length [llength $lkeys]
+	set rkeys_length [llength $rkeys]
+	set lnums_length [llength $lnums]
+	set rnums_length [llength $rnums]
+	set lspec_length [llength $lspec]
+	set rspec_length [llength $rspec]
+	
+	psplit $minnum left right
+	for {set i 0} {$i<$left} {incr i} {
+		passinsert lpass [lindex $lnums [rand $lnums_length]]
+	}
+	for {set i 0} {$i<$right} {incr i} {
+		passinsert rpass [lindex $rnums [rand $rnums_length]]
+	}
+	
+	psplit $minlower left right
+	for {set i 0} {$i<$left} {incr i} {
+		passinsert lpass [lindex $lkeys [rand $lkeys_length]]
+	}
+	for {set i 0} {$i<$right} {incr i} {
+		passinsert rpass [lindex $rkeys [rand $rkeys_length]]
+	}
+	
+	psplit $minupper left right
+	for {set i 0} {$i<$left} {incr i} {
+		passinsert lpass [string toupper [lindex $lkeys [rand $lkeys_length]]]
+	}
+	for {set i 0} {$i<$right} {incr i} {
+		passinsert rpass [string toupper [lindex $rkeys [rand $rkeys_length]]]
+	}
+	
+	psplit $minspecial left right
+	for {set i 0} {$i<$left} {incr i} {
+		passinsert lpass [lindex $lspec [rand $lspec_length]]
+	}
+	for {set i 0} {$i<$right} {incr i} {
+		passinsert rpass [lindex $rspec [rand $rspec_length]]
+	}
+	
+	# merge results together
+	foreach l $lpass r $rpass {
+    	if {$initially_left} {
+		append newpassword $l $r
+    	} else {
+		append newpassword $r $l
+    	}
+	}
+	
+	return $newpassword
+}
+
+# If specified, get the sudoers edit script
+if {[info exists getfilename]} {
+	getfile
+}
+
+# If specified, get the sudoers edit script
+if {[info exists geteditsudoers]} {
+	geteditsudoersfile
+}
+	
+# If specified, compare users specified in the file
+if {[info exists usernamescompare]} {
+	userlistcompare
+}
+	
+# If specified, audit users older than specified days
+if {[info exists auditunusedaccount]} {
+	auditunusedaccounts
+}
+
+# If specified, process user transactions
+if {[info exists adminusersfile]} {
+	adminusers
+}	
+
+# If specified, process sudoers transactions
+if {[info exists updatesudoersfile]} {
+	updatesudoers
+}	
+
+# If specified, change the specified users password 
+if {[info exists passwordusername]} {
+	resetuserpassword
+}	
